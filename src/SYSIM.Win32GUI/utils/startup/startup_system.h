@@ -13,10 +13,19 @@ namespace StartupSystem {
         std::wstring description;
     };
 
-    // Get list of system components (services and drivers) with auto-start
     std::vector<SystemComponent> GetAutoStartComponents();
-
-    // Enable/disable component (change startup type)
     bool SetComponentStartType(const std::wstring& name, DWORD newStartType, bool isDriver);
 
-}
+    struct StartupEntry {
+        std::wstring name;
+        std::wstring path;
+        std::wstring location;
+        bool enabled;
+    };
+
+    std::vector<StartupEntry> GetAllStartupEntries();
+    bool RemoveStartupEntry(const std::wstring& name, const std::wstring& location);
+    bool UpdateStartupEntry(const std::wstring& name, const std::wstring& location,
+        const std::wstring& newPath, bool enabled);
+
+} // namespace StartupSystem

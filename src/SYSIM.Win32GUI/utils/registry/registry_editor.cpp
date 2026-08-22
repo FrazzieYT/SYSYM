@@ -6,7 +6,7 @@
 #include <cwchar>
 #include <cstring>
 #pragma comment(lib, "advapi32.lib")
-
+// Устарел - исключение из сборки
 namespace RegistryEditor {
 
     // Helper functions

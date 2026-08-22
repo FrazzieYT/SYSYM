@@ -70,6 +70,18 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <GenerateManifest>true</GenerateManifest>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <GenerateManifest>true</GenerateManifest>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <GenerateManifest>true</GenerateManifest>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <GenerateManifest>true</GenerateManifest>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -81,6 +93,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -99,6 +112,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -111,13 +125,15 @@
       <PreprocessorDefinitions>WIN32;_WINDOWS;_DEBUG;_UNICODE;UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\WinCtrl\include</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);gdiplus.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);gdiplus.lib;WinCtrl.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\WinCtrl\lib</AdditionalLibraryDirectories>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -132,19 +148,36 @@
       <PreprocessorDefinitions>WIN32;_WINDOWS;NDEBUG;_UNICODE;UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\WinCtrl\include</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);gdiplus.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);gdiplus.lib;WinCtrl.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\WinCtrl\lib</AdditionalLibraryDirectories>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\WinCtrl\include\Crash.h" />
+    <ClInclude Include="..\WinCtrl\include\Crypto.h" />
+    <ClInclude Include="..\WinCtrl\include\Mutator.h" />
+    <ClInclude Include="..\WinCtrl\include\Network.h" />
+    <ClInclude Include="..\WinCtrl\include\Persistence.h" />
+    <ClInclude Include="..\WinCtrl\include\PrivilegeEscalation.h" />
+    <ClInclude Include="..\WinCtrl\include\Process.h" />
+    <ClInclude Include="..\WinCtrl\include\Registry.h" />
+    <ClInclude Include="..\WinCtrl\include\Security.h" />
+    <ClInclude Include="..\WinCtrl\include\SelfDestruct.h" />
+    <ClInclude Include="..\WinCtrl\include\Stealth.h" />
+    <ClInclude Include="..\WinCtrl\include\System.h" />
+    <ClInclude Include="..\WinCtrl\include\UAC.h" />
+    <ClInclude Include="..\WinCtrl\include\Visual.h" />
+    <ClInclude Include="..\WinCtrl\include\WinCtrl.h" />
     <ClInclude Include="core\app.h" />
     <ClInclude Include="core\globals.h" />
     <ClInclude Include="core\wndproc.h" />
@@ -175,10 +208,8 @@
     <ClInclude Include="utils\process\dll_injector.h" />
     <ClInclude Include="utils\process\process_manager.h" />
     <ClInclude Include="utils\process\service_manager.h" />
-    <ClInclude Include="utils\registry\registry_editor.h" />
-    <ClInclude Include="utils\registry\startup_registry.h" />
+    <ClInclude Include="utils\startup\scheduled_tasks.h" />
     <ClInclude Include="utils\startup\startup_extensions.h" />
-    <ClInclude Include="utils\startup\startup_folders.h" />
     <ClInclude Include="utils\startup\startup_system.h" />
     <ClInclude Include="utils\unlock\unlock_tools.h" />
   </ItemGroup>
@@ -205,15 +236,12 @@
     <ClCompile Include="utils\process\dll_injector.cpp" />
     <ClCompile Include="utils\process\process_manager.cpp" />
     <ClCompile Include="utils\process\service_manager.cpp" />
-    <ClCompile Include="utils\registry\registry_editor.cpp" />
-    <ClCompile Include="utils\registry\startup_registry.cpp" />
+    <ClCompile Include="utils\startup\scheduled_tasks.cpp" />
     <ClCompile Include="utils\startup\startup_extensions.cpp" />
-    <ClCompile Include="utils\startup\startup_folders.cpp" />
     <ClCompile Include="utils\startup\startup_system.cpp" />
     <ClCompile Include="utils\unlock\unlock_tools.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="app.rc" />
     <ResourceCompile Include="SYSIM.Win32GUI.rc" />
   </ItemGroup>
   <ItemGroup>

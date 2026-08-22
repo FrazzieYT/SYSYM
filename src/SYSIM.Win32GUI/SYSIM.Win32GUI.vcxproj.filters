@@ -37,9 +37,6 @@
     <Filter Include="Utils\process">
       <UniqueIdentifier>{0e3b9b0f-dc4c-4cbe-b146-63df9817cae0}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Utils\registry">
-      <UniqueIdentifier>{eff80aa3-3eb4-4473-998d-c7cf9413703f}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Utils\startup">
       <UniqueIdentifier>{e96afd39-c9d3-4a89-8f76-ed7b20e009d4}</UniqueIdentifier>
     </Filter>
@@ -48,6 +45,9 @@
     </Filter>
     <Filter Include="Utils\accounts">
       <UniqueIdentifier>{63940d02-aef4-4de1-9852-324f7c5d4d6a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="WinCtrl">
+      <UniqueIdentifier>{8a806586-5bac-4962-8433-fc0b97c870ad}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -117,17 +117,8 @@
     <ClInclude Include="utils\startup\startup_extensions.h">
       <Filter>Utils\startup</Filter>
     </ClInclude>
-    <ClInclude Include="utils\startup\startup_folders.h">
-      <Filter>Utils\startup</Filter>
-    </ClInclude>
     <ClInclude Include="utils\startup\startup_system.h">
       <Filter>Utils\startup</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\registry\registry_editor.h">
-      <Filter>Utils\registry</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\registry\startup_registry.h">
-      <Filter>Utils\registry</Filter>
     </ClInclude>
     <ClInclude Include="utils\process\dll_injector.h">
       <Filter>Utils\process</Filter>
@@ -158,6 +149,54 @@
     </ClInclude>
     <ClInclude Include="features\accounts.h">
       <Filter>Features</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Crash.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Crypto.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Mutator.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Network.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Persistence.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\PrivilegeEscalation.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Process.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Registry.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Security.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\SelfDestruct.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Stealth.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\System.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\UAC.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\Visual.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\WinCtrl\include\WinCtrl.h">
+      <Filter>WinCtrl</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\startup\scheduled_tasks.h">
+      <Filter>Utils\startup</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -203,17 +242,8 @@
     <ClCompile Include="utils\startup\startup_extensions.cpp">
       <Filter>Utils\startup</Filter>
     </ClCompile>
-    <ClCompile Include="utils\startup\startup_folders.cpp">
-      <Filter>Utils\startup</Filter>
-    </ClCompile>
     <ClCompile Include="utils\startup\startup_system.cpp">
       <Filter>Utils\startup</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\registry\registry_editor.cpp">
-      <Filter>Utils\registry</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\registry\startup_registry.cpp">
-      <Filter>Utils\registry</Filter>
     </ClCompile>
     <ClCompile Include="utils\process\dll_injector.cpp">
       <Filter>Utils\process</Filter>
@@ -245,13 +275,13 @@
     <ClCompile Include="features\accounts.cpp">
       <Filter>Features</Filter>
     </ClCompile>
+    <ClCompile Include="utils\startup\scheduled_tasks.cpp">
+      <Filter>Utils\startup</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="SYSIM.Win32GUI.rc">
       <Filter>Файлы ресурсов</Filter>
-    </ResourceCompile>
-    <ResourceCompile Include="app.rc">
-      <Filter>Файлы заголовков</Filter>
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
