@@ -16,3 +16,6 @@ void CancelExplorerAddressBarEdit();
 bool ExplorerLeftButtonDown(int x, int y, const RectF& contentArea);
 bool ExplorerMouseMove(int x, int y, const RectF& contentArea);
 bool ExplorerLeftButtonUp();
+
+// Scrollbar
+bool ExplorerMouseWheel(int delta, const RectF& contentArea);

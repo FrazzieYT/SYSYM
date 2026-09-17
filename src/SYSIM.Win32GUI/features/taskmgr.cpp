@@ -2,18 +2,24 @@
 #include "core/globals.h"
 #include "core/app.h"
 #include "ui/widgets.h"
-#include "utils/process/process_manager.h"
-#include "utils/process/dll_injector.h"
+#include "../WinCtrl/include/Process.h"
+#include "utils/process/service_manager.h"
 #include "utils/registry/startup_registry.h"
-
+#include "utils/startup/startup_edit_dialog.h"
+#include "utils/startup/service_edit_dialog.h"
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <commdlg.h>
 #include <unordered_map>
+#include <functional>
+#include <psapi.h>
+#include <tlhelp32.h>
 
+#pragma comment(lib, "../WinCtrl/lib/WinCtrl.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "psapi.lib")
 
 #define TASKMGR_SHOW_RECOVERY_MESSAGE 1
 #define TASKMGR_AUTO_REFRESH_INTERVAL_MS 2000
@@ -50,11 +56,31 @@ enum : int {
     IDM_STARTUP_DISABLE,
     IDM_STARTUP_ENABLE,
     IDM_STARTUP_REMOVE,
+
+    IDM_SVC_EDIT = 1110,
+    IDM_STARTUP_EDIT = 1210,
 };
 
-// Tab state
-static std::vector<ProcessManager::ProcessInfo> g_processes;
-static std::vector<ProcessManager::ServiceInfo> g_services;
+struct ProcessDisplayInfo {
+    DWORD pid = 0;
+    DWORD parentPid = 0;
+    std::wstring name;
+    std::wstring fullPath;
+    std::wstring userName;
+    SIZE_T memoryUsage = 0;
+    int threadCount = 0;
+    int handleCount = 0;
+    DWORD priority = 0;
+    FILETIME kernelTime{};
+    FILETIME userTime{};
+    bool critical = false;
+    bool suspended = false;
+    bool wow64 = false;
+};
+
+// Глобальные данные
+static std::vector<ProcessDisplayInfo> g_processes;
+static std::vector<ServiceManager::ServiceInfo> g_services;
 static std::vector<StartupRegistry::StartupEntry> g_startupEntries;
 
 static int g_selectedProcessIndex = -1;
@@ -63,7 +89,7 @@ static int g_selectedStartupIndex = -1;
 
 static bool g_forceRefresh = false;
 static unsigned long long g_lastRefreshTick = 0;
-static bool g_autoRefresh = true;
+bool g_autoRefresh = true;
 
 static std::wstring g_searchText;
 static bool g_searchActive = false;
@@ -79,16 +105,15 @@ static std::unordered_map<DWORD, float> g_cpuUsagePercent;
 
 static RectF g_btnEndProcess;
 static RectF g_btnRefresh;
-static RectF g_btnAutoRefresh;
 static RectF g_searchBoxRect;
+static RectF g_btnCreate;
 
 static const float MARGIN = 8.0f;
-static const float TOOLBAR_HEIGHT = 40.0f;
-static const float HEADER_HEIGHT = 24.0f;
-static const float ROW_HEIGHT = 22.0f;
-static const float SEARCH_HEIGHT = 28.0f;
+static const float TOOLBAR_HEIGHT = 36.0f;
+static const float SUBTAB_HEIGHT = 26.0f;
+static const float ROW_HEIGHT = 26.0f;
+static const float SEARCH_HEIGHT = 26.0f;
 
-// Column resize state
 static const float COL_MIN_WIDTH = 40.0f;
 static const float COL_MAX_WIDTH = 600.0f;
 static const float RESIZE_HIT_ZONE = 5.0f;
@@ -102,31 +127,41 @@ static int g_resizingColIndex = -1;
 static float g_resizingStartX = 0.0f;
 static float g_resizingStartWidth = 0.0f;
 
-// Layout
 struct TaskmgrLayout {
+    RectF subTabs;
     RectF toolbar;
     RectF searchBox;
     RectF listArea;
     float listDataTop = 0.0f;
 };
 
-static TaskmgrLayout GetLayout(const RectF& contentArea) {
+static TaskmgrLayout GetLayout(const RectF& contentArea, bool subTabsExpanded) {
     TaskmgrLayout L;
-    L.toolbar = RectF(contentArea.X + MARGIN, contentArea.Y + MARGIN,
-        contentArea.Width - 2.0f * MARGIN, TOOLBAR_HEIGHT);
-    L.searchBox = RectF(contentArea.X + MARGIN,
-        L.toolbar.Y + L.toolbar.Height + 4.0f,
-        contentArea.Width - 2.0f * MARGIN, SEARCH_HEIGHT);
-    float listY = L.searchBox.Y + L.searchBox.Height + 4.0f;
-    float listHeight = contentArea.Height - (listY - contentArea.Y) - MARGIN;
+    float y = contentArea.Y + 4.0f;
+    float x = contentArea.X + MARGIN;
+    float w = contentArea.Width - 2.0f * MARGIN;
+
+    if (subTabsExpanded) {
+        L.subTabs = RectF(x, y, w, SUBTAB_HEIGHT);
+        y += SUBTAB_HEIGHT + 4.0f;
+    }
+    else {
+        L.subTabs = RectF(0, 0, 0, 0);
+    }
+
+    L.toolbar = RectF(x, y, w, TOOLBAR_HEIGHT);
+    y += TOOLBAR_HEIGHT + 4.0f;
+
+    L.searchBox = RectF(x, y, w, SEARCH_HEIGHT);
+    y += SEARCH_HEIGHT + 4.0f;
+
+    float listHeight = contentArea.Height - (y - contentArea.Y) - MARGIN;
     if (listHeight < 0.0f) listHeight = 0.0f;
-    L.listArea = RectF(contentArea.X + MARGIN, listY,
-        contentArea.Width - 2.0f * MARGIN, listHeight);
-    L.listDataTop = L.listArea.Y + HEADER_HEIGHT + 6.0f;
+    L.listArea = RectF(x, y, w, listHeight);
+    L.listDataTop = L.listArea.Y + 24.0f + 6.0f;
     return L;
 }
 
-// Recovery environment
 static bool IsLikelyRecoveryEnvironment() {
     static int cached = -1;
     if (cached != -1) return cached == 1;
@@ -160,7 +195,6 @@ static bool IsLikelyRecoveryEnvironment() {
     return result;
 }
 
-// Formatting
 static std::wstring FormatMemory(unsigned long long bytes) {
     if (bytes < 1024) return std::to_wstring(bytes) + L" Б";
     else if (bytes < 1024 * 1024) return std::to_wstring(bytes / 1024) + L" КБ";
@@ -174,31 +208,32 @@ static std::wstring FormatCpu(float percent) {
     return buf;
 }
 
-static std::wstring ServiceStatusToString(DWORD status) {
-    switch (status) {
-    case SERVICE_STOPPED:          return L"Остановлена";
-    case SERVICE_START_PENDING:    return L"Запускается...";
-    case SERVICE_STOP_PENDING:     return L"Останавливается...";
-    case SERVICE_RUNNING:          return L"Работает";
-    case SERVICE_CONTINUE_PENDING: return L"Возобновляется...";
-    case SERVICE_PAUSE_PENDING:    return L"Приостанавливается...";
-    case SERVICE_PAUSED:           return L"Приостановлена";
-    default:                       return L"Неизвестно";
+static std::wstring ServiceStatusToString(ServiceManager::ServiceState state) {
+    using State = ServiceManager::ServiceState;
+    switch (state) {
+    case State::Stopped:          return L"Остановлена";
+    case State::StartPending:     return L"Запускается...";
+    case State::StopPending:      return L"Останавливается...";
+    case State::Running:          return L"Работает";
+    case State::ContinuePending:  return L"Возобновляется...";
+    case State::PausePending:     return L"Приостанавливается...";
+    case State::Paused:           return L"Приостановлена";
+    default:                      return L"Неизвестно";
     }
 }
 
-static std::wstring ServiceStartTypeToString(DWORD startType) {
-    switch (startType) {
-    case SERVICE_BOOT_START:   return L"Загрузочная";
-    case SERVICE_SYSTEM_START: return L"Системная";
-    case SERVICE_AUTO_START:   return L"Авто";
-    case SERVICE_DEMAND_START: return L"Вручную";
-    case SERVICE_DISABLED:     return L"Отключена";
-    default:                   return L"Неизвестно";
+static std::wstring ServiceStartTypeToString(ServiceManager::ServiceStartType st) {
+    using ST = ServiceManager::ServiceStartType;
+    switch (st) {
+    case ST::Boot:    return L"Загрузочная";
+    case ST::System:  return L"Системная";
+    case ST::Auto:    return L"Авто";
+    case ST::Demand:  return L"Вручную";
+    case ST::Disabled:return L"Отключена";
+    default:          return L"Неизвестно";
     }
 }
 
-// CPU tracking
 static unsigned long long FileTimeToULL(const FILETIME& ft) {
     return ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
@@ -241,14 +276,55 @@ static void UpdateCpuUsage() {
     g_cpuUsagePercent = std::move(newCpu);
 }
 
-// Refresh
+static int GetThreadCount(DWORD pid) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+    if (Process32FirstW(hSnapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                CloseHandle(hSnapshot);
+                return pe.cntThreads;
+            }
+        } while (Process32NextW(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+    return 0;
+}
+
 static void RefreshProcessList() {
-    g_processes = ProcessManager::GetProcessList(false);
+    auto pidList = WinCtrl::Process::GetList();
+    g_processes.clear();
+    g_processes.reserve(pidList.size());
+
+    for (const auto& pe : pidList) {
+        DWORD pid = pe.th32ProcessID;
+        ProcessDisplayInfo info{};
+        info.pid = pid;
+        info.parentPid = pe.th32ParentProcessID;
+        info.name = pe.szExeFile;
+
+        auto procInfo = WinCtrl::Process::GetProcessInfo(pid);
+        info.fullPath = procInfo.imagePath;
+        info.userName = procInfo.userName;
+        info.memoryUsage = procInfo.workingSetSize;
+        info.priority = procInfo.priorityClass;
+        info.critical = procInfo.isCritical;
+        info.suspended = procInfo.isSuspended;
+        info.wow64 = procInfo.isWow64;
+        info.handleCount = procInfo.handleCount;
+        info.kernelTime = procInfo.kernelTime;
+        info.userTime = procInfo.userTime;
+        info.threadCount = GetThreadCount(pid);
+
+        g_processes.push_back(info);
+    }
+
     UpdateCpuUsage();
 }
 
 static void RefreshServicesList() {
-    g_services = ProcessManager::GetServicesList();
+    g_services = ServiceManager::GetServices();
 }
 
 static void RefreshStartupList() {
@@ -275,7 +351,62 @@ void TaskManagerOnTimer() {
     }
 }
 
-// Filtering
+struct SystemStatsEx {
+    unsigned long long totalRam = 0;
+    unsigned long long usedRam = 0;
+    float cpuUsagePercent = 0.0f;
+    int totalProcesses = 0;
+};
+
+static SystemStatsEx GetSystemStatsEx() {
+    SystemStatsEx stats;
+
+    MEMORYSTATUSEX memStatus{};
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        stats.totalRam = memStatus.ullTotalPhys;
+        stats.usedRam = memStatus.ullTotalPhys - memStatus.ullAvailPhys;
+    }
+
+    static FILETIME prevIdleTime{};
+    static FILETIME prevKernelTime{};
+    static FILETIME prevUserTime{};
+    static bool initialized = false;
+
+    FILETIME idleTime{}, kernelTime{}, userTime{};
+    if (GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+        if (initialized) {
+            auto toULL = [](const FILETIME& ft) -> unsigned long long {
+                return (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                };
+            unsigned long long idle = toULL(idleTime) - toULL(prevIdleTime);
+            unsigned long long kernel = toULL(kernelTime) - toULL(prevKernelTime);
+            unsigned long long user = toULL(userTime) - toULL(prevUserTime);
+            unsigned long long total = kernel + user;
+            if (total > 0) {
+                stats.cpuUsagePercent = static_cast<float>((total - idle) * 100.0 / total);
+            }
+        }
+        prevIdleTime = idleTime;
+        prevKernelTime = kernelTime;
+        prevUserTime = userTime;
+        initialized = true;
+    }
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+        if (Process32FirstW(hSnapshot, &pe)) {
+            do {
+                stats.totalProcesses++;
+            } while (Process32NextW(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    return stats;
+}
+
 static bool MatchesSearch(const std::wstring& text) {
     if (g_searchText.empty()) return true;
     std::wstring lower = text, search = g_searchText;
@@ -337,7 +468,6 @@ static std::vector<int> GetFilteredStartupIndices() {
     return result;
 }
 
-// UI helper functions
 static std::wstring TaskMgr_BrowseDll() {
     wchar_t file[MAX_PATH] = {};
     OPENFILENAMEW ofn{};
@@ -375,15 +505,14 @@ static void CopyToClipboard(const std::wstring& text) {
     CloseClipboard();
 }
 
-// Command execution and processes
-static void ExecuteProcessCommand(int cmd, const ProcessManager::ProcessInfo& proc) {
+static void ExecuteProcessCommand(int cmd, const ProcessDisplayInfo& proc) {
     HWND hwnd = App::Instance()->GetHWND();
     switch (cmd) {
     case IDM_PROC_TERMINATE: {
         std::wstring msg = L"Завершить процесс?\r\n\r\n" + proc.name +
             L" (PID: " + std::to_wstring(proc.pid) + L")";
         if (MessageBoxW(hwnd, msg.c_str(), L"Завершение", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            if (ProcessManager::TerminateProcess(proc.pid)) DoRefresh();
+            if (WinCtrl::Process::Terminate(proc.pid)) DoRefresh();
             else MessageBoxW(hwnd, L"Не удалось завершить процесс.", L"Ошибка", MB_OK | MB_ICONERROR);
         }
         break;
@@ -392,33 +521,53 @@ static void ExecuteProcessCommand(int cmd, const ProcessManager::ProcessInfo& pr
         std::wstring msg = L"Завершить дерево процессов?\r\n\r\n" + proc.name +
             L" (PID: " + std::to_wstring(proc.pid) + L")";
         if (MessageBoxW(hwnd, msg.c_str(), L"Завершение дерева", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            if (ProcessManager::TerminateProcessTree(proc.pid)) DoRefresh();
+            if (WinCtrl::Process::KillProcessTree(proc.pid)) DoRefresh();
         }
         break;
     }
     case IDM_PROC_SUSPEND:
-        ProcessManager::SuspendProcess(proc.pid);
+        WinCtrl::Process::SuspendProcess(proc.pid);
         DoRefresh();
         break;
     case IDM_PROC_RESUME:
-        ProcessManager::ResumeProcess(proc.pid);
+        WinCtrl::Process::ResumeProcess(proc.pid);
         DoRefresh();
         break;
     case IDM_PROC_CLEAR_CRITICAL:
         if (MessageBoxW(hwnd, L"Снять критичность?", L"Внимание", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            ProcessManager::SetProcessCritical(proc.pid, false);
+            WinCtrl::Process::SetProcessCritical(proc.pid, false);
             DoRefresh();
         }
         break;
-    case IDM_PROC_PRIORITY_REALTIME:      ProcessManager::SetProcessPriority(proc.pid, REALTIME_PRIORITY_CLASS); DoRefresh(); break;
-    case IDM_PROC_PRIORITY_HIGH:          ProcessManager::SetProcessPriority(proc.pid, HIGH_PRIORITY_CLASS); DoRefresh(); break;
-    case IDM_PROC_PRIORITY_ABOVE_NORMAL:  ProcessManager::SetProcessPriority(proc.pid, ABOVE_NORMAL_PRIORITY_CLASS); DoRefresh(); break;
-    case IDM_PROC_PRIORITY_NORMAL:        ProcessManager::SetProcessPriority(proc.pid, NORMAL_PRIORITY_CLASS); DoRefresh(); break;
-    case IDM_PROC_PRIORITY_BELOW_NORMAL:  ProcessManager::SetProcessPriority(proc.pid, BELOW_NORMAL_PRIORITY_CLASS); DoRefresh(); break;
-    case IDM_PROC_PRIORITY_LOW:           ProcessManager::SetProcessPriority(proc.pid, IDLE_PRIORITY_CLASS); DoRefresh(); break;
+    case IDM_PROC_PRIORITY_REALTIME:
+        WinCtrl::Process::SetProcessPriority(proc.pid, REALTIME_PRIORITY_CLASS);
+        DoRefresh();
+        break;
+    case IDM_PROC_PRIORITY_HIGH:
+        WinCtrl::Process::SetProcessPriority(proc.pid, HIGH_PRIORITY_CLASS);
+        DoRefresh();
+        break;
+    case IDM_PROC_PRIORITY_ABOVE_NORMAL:
+        WinCtrl::Process::SetProcessPriority(proc.pid, ABOVE_NORMAL_PRIORITY_CLASS);
+        DoRefresh();
+        break;
+    case IDM_PROC_PRIORITY_NORMAL:
+        WinCtrl::Process::SetProcessPriority(proc.pid, NORMAL_PRIORITY_CLASS);
+        DoRefresh();
+        break;
+    case IDM_PROC_PRIORITY_BELOW_NORMAL:
+        WinCtrl::Process::SetProcessPriority(proc.pid, BELOW_NORMAL_PRIORITY_CLASS);
+        DoRefresh();
+        break;
+    case IDM_PROC_PRIORITY_LOW:
+        WinCtrl::Process::SetProcessPriority(proc.pid, IDLE_PRIORITY_CLASS);
+        DoRefresh();
+        break;
     case IDM_PROC_OPEN_LOCATION: {
-        std::wstring path = proc.fullPath.empty() ? ProcessManager::GetProcessPath(proc.pid) : proc.fullPath;
-        if (!path.empty()) ProcessManager::OpenFileLocation(path);
+        std::wstring path = proc.fullPath.empty() ? WinCtrl::Process::GetImagePath(proc.pid) : proc.fullPath;
+        if (!path.empty()) {
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+        }
         break;
     }
     case IDM_PROC_COPY_PID:  CopyToClipboard(std::to_wstring(proc.pid)); break;
@@ -431,7 +580,7 @@ static void ExecuteProcessCommand(int cmd, const ProcessManager::ProcessInfo& pr
         }
         std::wstring dllPath = TaskMgr_BrowseDll();
         if (dllPath.empty()) break;
-        if (DllInjector::InjectDLL(proc.pid, dllPath)) {
+        if (WinCtrl::Process::InjectDLL(proc.pid, dllPath)) {
             MessageBoxW(hwnd, L"DLL инжектирована", L"Успех", MB_OK | MB_ICONINFORMATION);
         }
         else {
@@ -442,20 +591,67 @@ static void ExecuteProcessCommand(int cmd, const ProcessManager::ProcessInfo& pr
     }
 }
 
-// Command execution via services
-static void ExecuteServiceCommand(int cmd, const ProcessManager::ServiceInfo& svc) {
+static bool ResolveStartupLocation(const StartupRegistry::StartupEntry& entry,StartupEditDialog::Location& out) {
+    using Src = StartupRegistry::StartupSource;
+    // Основные ветки:
+    //   HKCU_Run     → HKEY_CURRENT_USER,  kRun
+    //   HKCU_RunOnce → HKEY_CURRENT_USER,  kRunOnce
+    //   HKLM_Run     → HKEY_LOCAL_MACHINE, kRun
+    //   HKLM_RunOnce → HKEY_LOCAL_MACHINE, kRunOnce
+    static const wchar_t* kRun = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    static const wchar_t* kRunOnce = L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+
+    // Заглушка вернуть false
+    /*
+    switch (entry.source) {
+    case Src::HKCU_Run:
+        out.root = HKEY_CURRENT_USER;  out.subKey = kRun;
+        out.label = L"HKCU \\ Run";    return true;
+    case Src::HKCU_RunOnce:
+        out.root = HKEY_CURRENT_USER;  out.subKey = kRunOnce;
+        out.label = L"HKCU \\ RunOnce"; return true;
+    case Src::HKLM_Run:
+        out.root = HKEY_LOCAL_MACHINE; out.subKey = kRun;
+        out.label = L"HKLM \\ Run";    return true;
+    case Src::HKLM_RunOnce:
+        out.root = HKEY_LOCAL_MACHINE; out.subKey = kRunOnce;
+        out.label = L"HKLM \\ RunOnce"; return true;
+    }
+    */
+    (void)entry; (void)out;
+    return false;
+}
+
+static void ExecuteServiceCommand(int cmd, const ServiceManager::ServiceInfo& svc) {
     switch (cmd) {
-    case IDM_SVC_START:    ProcessManager::StartService(svc.name); break;
-    case IDM_SVC_STOP:     ProcessManager::StopService(svc.name); break;
-    case IDM_SVC_RESTART:  ProcessManager::RestartService(svc.name); break;
-    case IDM_SVC_AUTO:     ProcessManager::SetServiceStartType(svc.name, SERVICE_AUTO_START); break;
-    case IDM_SVC_MANUAL:   ProcessManager::SetServiceStartType(svc.name, SERVICE_DEMAND_START); break;
-    case IDM_SVC_DISABLED: ProcessManager::SetServiceStartType(svc.name, SERVICE_DISABLED); break;
+    case IDM_SVC_START:
+        ServiceManager::StartService(svc.name);
+        break;
+    case IDM_SVC_STOP:
+        ServiceManager::StopService(svc.name);
+        break;
+    case IDM_SVC_RESTART: {
+        ServiceManager::StopService(svc.name);
+        Sleep(500);
+        ServiceManager::StartService(svc.name);
+        break;
+    }
+    case IDM_SVC_AUTO:
+        ServiceManager::SetStartType(svc.name, ServiceManager::ServiceStartType::Auto);
+        break;
+    case IDM_SVC_MANUAL:
+        ServiceManager::SetStartType(svc.name, ServiceManager::ServiceStartType::Demand);
+        break;
+    case IDM_SVC_DISABLED:
+        ServiceManager::SetStartType(svc.name, ServiceManager::ServiceStartType::Disabled);
+        break;
+    case IDM_SVC_EDIT:
+        ServiceEditDialog::ShowEdit(App::Instance()->GetHWND(), svc.name);
+        break;
     }
     DoRefresh();
 }
 
-// Command execution at startup
 static void ExecuteStartupCommand(int cmd, const StartupRegistry::StartupEntry& entry) {
     HWND hwnd = App::Instance()->GetHWND();
     switch (cmd) {
@@ -469,7 +665,9 @@ static void ExecuteStartupCommand(int cmd, const StartupRegistry::StartupEntry& 
             size_t spacePos = path.find(L' ');
             if (spacePos != std::wstring::npos) path = path.substr(0, spacePos);
         }
-        if (!path.empty()) ProcessManager::OpenFileLocation(path);
+        if (!path.empty()) {
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+        }
         break;
     }
     case IDM_STARTUP_DISABLE:
@@ -492,10 +690,19 @@ static void ExecuteStartupCommand(int cmd, const StartupRegistry::StartupEntry& 
         }
         break;
     }
+    case IDM_STARTUP_EDIT: {
+        StartupEditDialog::Location loc;
+        if (!ResolveStartupLocation(entry, loc)) {
+            MessageBoxW(hwnd, L"Источник не поддерживает редактирование.", L"Инфо", MB_OK);
+            break;
+        }
+        if (StartupEditDialog::ShowEdit(hwnd, loc, entry.valueName))
+            DoRefresh();
+        break;
+    }
     }
 }
 
-// Column width initialization
 static void InitColumnWidths(const RectF& listArea) {
     if (g_colWidthsInitialized) return;
     float w = listArea.Width;
@@ -517,12 +724,11 @@ static void InitColumnWidths(const RectF& listArea) {
     g_colWidthsInitialized = true;
 }
 
-// Column divider hit detection
 static int GetColumnResizeHit(float fx, float fy, const RectF& contentArea) {
-    TaskmgrLayout L = GetLayout(contentArea);
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     int tab = g_activeSubTab;
 
-    if (fy < L.listArea.Y || fy > L.listArea.Y + HEADER_HEIGHT + 6.0f) return -1;
+    if (fy < L.listArea.Y || fy > L.listArea.Y + 24.0f + 6.0f) return -1;
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width) return -1;
 
     float colX = L.listArea.X + 6.0f;
@@ -544,9 +750,8 @@ static int GetColumnResizeHit(float fx, float fy, const RectF& contentArea) {
     return -1;
 }
 
-// Hit testing строк
 static int GetProcessRowAt(float fx, float fy, const RectF& contentArea) {
-    TaskmgrLayout L = GetLayout(contentArea);
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width ||
         fy < L.listDataTop || fy > L.listArea.Y + L.listArea.Height) return -1;
     auto filtered = GetFilteredProcessIndices();
@@ -560,7 +765,7 @@ static int GetProcessRowAt(float fx, float fy, const RectF& contentArea) {
 }
 
 static int GetServiceRowAt(float fx, float fy, const RectF& contentArea) {
-    TaskmgrLayout L = GetLayout(contentArea);
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width ||
         fy < L.listDataTop || fy > L.listArea.Y + L.listArea.Height) return -1;
     auto filtered = GetFilteredServiceIndices();
@@ -574,7 +779,7 @@ static int GetServiceRowAt(float fx, float fy, const RectF& contentArea) {
 }
 
 static int GetStartupRowAt(float fx, float fy, const RectF& contentArea) {
-    TaskmgrLayout L = GetLayout(contentArea);
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width ||
         fy < L.listDataTop || fy > L.listArea.Y + L.listArea.Height) return -1;
     auto filtered = GetFilteredStartupIndices();
@@ -588,8 +793,8 @@ static int GetStartupRowAt(float fx, float fy, const RectF& contentArea) {
 }
 
 static SortColumn GetColumnAtHeader(float fx, float fy, const RectF& contentArea) {
-    TaskmgrLayout L = GetLayout(contentArea);
-    if (fy < L.listArea.Y || fy > L.listArea.Y + HEADER_HEIGHT) return SortColumn::None;
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
+    if (fy < L.listArea.Y || fy > L.listArea.Y + 24.0f) return SortColumn::None;
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width) return SortColumn::None;
 
     float colX = L.listArea.X + 6.0f;
@@ -602,7 +807,6 @@ static SortColumn GetColumnAtHeader(float fx, float fy, const RectF& contentArea
     return SortColumn::None;
 }
 
-// Drawing helpers
 static void DrawButton(Graphics& g, const RectF& r, const std::wstring& text,
     Font& font, SolidBrush& bg, SolidBrush& txt, Pen& pen, bool checked = false) {
     SolidBrush* useBg = &bg;
@@ -619,7 +823,7 @@ static void DrawScrollableRows(
     int totalRows, int& scrollOffset,
     std::function<void(int, float, bool)> drawRow
 ) {
-    float visibleHeight = listArea.Height - HEADER_HEIGHT - 12.0f;
+    float visibleHeight = listArea.Height - 24.0f - 12.0f;
     if (visibleHeight < 0.0f) visibleHeight = 0.0f;
     int visibleRows = (int)(visibleHeight / ROW_HEIGHT);
     int maxScroll = (totalRows > visibleRows) ? (totalRows - visibleRows) * (int)ROW_HEIGHT : 0;
@@ -640,7 +844,6 @@ static void DrawScrollableRows(
     }
 }
 
-// Process rendering
 static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
     Font& headFont, Font& itemFont, Font& smallFont,
     SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
@@ -664,7 +867,7 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
     };
 
     for (int i = 0; i < 5; ++i) {
-        RectF hr(colX, headerY, g_procColWidths[i], HEADER_HEIGHT);
+        RectF hr(colX, headerY, g_procColWidths[i], 24.0f);
         std::wstring header = cols[i].name;
         if (g_sortColumn == cols[i].col) header += g_sortAscending ? L" ▲" : L" ▼";
         g.DrawString(header.c_str(), -1, &headFont, hr, &headerFormat, &textBrush);
@@ -719,7 +922,6 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
     g_scrollOffset[1] = scrollOffset;
 }
 
-// Service rendering
 static void DrawServices(Graphics& g, const TaskmgrLayout& L,
     Font& headFont, Font& itemFont, Font& smallFont,
     SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
@@ -733,7 +935,7 @@ static void DrawServices(Graphics& g, const TaskmgrLayout& L,
 
     const wchar_t* headers[] = { L"Служба", L"Статус", L"Тип запуска" };
     for (int i = 0; i < 3; ++i) {
-        RectF hr(colX, headerY, g_svcColWidths[i], HEADER_HEIGHT);
+        RectF hr(colX, headerY, g_svcColWidths[i], 24.0f);
         g.DrawString(headers[i], -1, &headFont, hr, &hf, &textBrush);
         colX += g_svcColWidths[i];
     }
@@ -763,12 +965,12 @@ static void DrawServices(Graphics& g, const TaskmgrLayout& L,
             cx += g_svcColWidths[0];
 
             RectF c2(cx, rowY, g_svcColWidths[1], ROW_HEIGHT);
-            std::wstring status = ServiceStatusToString(svc.status);
+            std::wstring status = ServiceStatusToString(svc.state);
             SolidBrush runBrush(Color(255, 100, 220, 100));
             SolidBrush stopBrush(Color(255, 200, 100, 100));
             SolidBrush* statusBrush = &mutedBrush;
-            if (svc.status == SERVICE_RUNNING) statusBrush = &runBrush;
-            else if (svc.status == SERVICE_STOPPED) statusBrush = &stopBrush;
+            if (svc.state == ServiceManager::ServiceState::Running) statusBrush = &runBrush;
+            else if (svc.state == ServiceManager::ServiceState::Stopped) statusBrush = &stopBrush;
             g.DrawString(status.c_str(), -1, &smallFont, c2, &f, statusBrush);
             cx += g_svcColWidths[1];
 
@@ -778,7 +980,6 @@ static void DrawServices(Graphics& g, const TaskmgrLayout& L,
     g_scrollOffset[1] = scrollOffset;
 }
 
-// Startup item rendering
 static void DrawStartup(Graphics& g, const TaskmgrLayout& L,
     Font& headFont, Font& itemFont, Font& smallFont,
     SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
@@ -792,7 +993,7 @@ static void DrawStartup(Graphics& g, const TaskmgrLayout& L,
 
     const wchar_t* headers[] = { L"Имя", L"Команда", L"Источник", L"Статус" };
     for (int i = 0; i < 4; ++i) {
-        RectF hr(colX, headerY, g_startupColWidths[i], HEADER_HEIGHT);
+        RectF hr(colX, headerY, g_startupColWidths[i], 24.0f);
         g.DrawString(headers[i], -1, &headFont, hr, &hf, &textBrush);
         colX += g_startupColWidths[i];
     }
@@ -855,6 +1056,16 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
         return;
     }
 
+    static int lastMainTab = -1;
+    if (g_activeMainTab == 1 && lastMainTab != 1) {
+        g_forceRefresh = true;
+        DoRefresh();
+        lastMainTab = 1;
+    }
+    else if (g_activeMainTab != 1) {
+        lastMainTab = g_activeMainTab;
+    }
+
     static bool initialized = false;
     if (!initialized || g_forceRefresh) {
         DoRefresh();
@@ -871,13 +1082,32 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     SolidBrush selBrush(COLOR_TAB_ACTIVE);
     Pen borderPen(COLOR_BORDER, 1.0f);
 
-    TaskmgrLayout L = GetLayout(contentArea);
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     InitColumnWidths(L.listArea);
 
-    // === Toolbar ===
+    if (g_subTabsExpanded) {
+        const wchar_t* subNames[3] = { L"Процессы", L"Службы", L"Автозагрузка" };
+        float subtabX = L.subTabs.X + 4.0f;
+        float subtabY = L.subTabs.Y + 2.0f;
+        float subtabW = (L.subTabs.Width - 8.0f) / 3.0f - 4.0f;
+        for (int i = 0; i < 3; ++i) {
+            RectF tabRect(subtabX + i * (subtabW + 4.0f), subtabY, subtabW, SUBTAB_HEIGHT - 4.0f);
+            g_subTabRects[i] = tabRect;
+            Color bg = (i == g_activeSubTab) ? COLOR_TAB_ACTIVE : COLOR_TAB_BG;
+            SolidBrush tabBg(bg);
+            g.FillRectangle(&tabBg, tabRect);
+            g.DrawRectangle(&borderPen, tabRect);
+            StringFormat tabF;
+            tabF.SetAlignment(StringAlignmentCenter);
+            tabF.SetLineAlignment(StringAlignmentCenter);
+            SolidBrush tabText(COLOR_TEXT);
+            g.DrawString(subNames[i], -1, &smallFont, tabRect, &tabF, &tabText);
+        }
+    }
+
     float x = L.toolbar.X;
     float y = L.toolbar.Y + 4.0f;
-    float btnH = 32.0f;
+    float btnH = 26.0f;
     int tab = g_activeSubTab;
 
     if (tab == 0) {
@@ -888,21 +1118,26 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     g_btnRefresh = RectF(x, y, 90.0f, btnH);
     DrawButton(g, g_btnRefresh, L"Обновить", itemFont, bgBrush, textBrush, borderPen);
     x += 96.0f;
-    g_btnAutoRefresh = RectF(x, y, 110.0f, btnH);
-    DrawButton(g, g_btnAutoRefresh, g_autoRefresh ? L"Авто: ВКЛ" : L"Авто: ВЫКЛ",
-        itemFont, bgBrush, textBrush, borderPen, g_autoRefresh);
-    x += 116.0f;
 
+    if (tab == 1 || tab == 2) {
+        g_btnCreate = RectF(x, y, 90.0f, btnH);
+        DrawButton(g, g_btnCreate, L"Создать", itemFont, bgBrush, textBrush, borderPen);
+        x += 96.0f;
+    }
+    else {
+        g_btnCreate = RectF(0, 0, 0, 0);
+    }
+
+    SystemStatsEx stats = GetSystemStatsEx();
     std::wstring countText;
     if (tab == 0) {
-        auto stats = ProcessManager::GetSystemStats();
-        countText = L"Процессов: " + std::to_wstring(g_processes.size()) +
+        countText = L"Процессов: " + std::to_wstring(stats.totalProcesses) +
             L"  |  RAM: " + FormatMemory(stats.usedRam) + L" / " + FormatMemory(stats.totalRam) +
             L"  |  ЦП: " + FormatCpu(stats.cpuUsagePercent);
     }
     else if (tab == 1) {
         int running = 0;
-        for (const auto& s : g_services) if (s.status == SERVICE_RUNNING) running++;
+        for (const auto& s : g_services) if (s.state == ServiceManager::ServiceState::Running) running++;
         countText = L"Служб: " + std::to_wstring(g_services.size()) +
             L"  |  Работает: " + std::to_wstring(running);
     }
@@ -913,7 +1148,6 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     StringFormat leftF; leftF.SetAlignment(StringAlignmentNear); leftF.SetLineAlignment(StringAlignmentCenter);
     g.DrawString(countText.c_str(), -1, &smallFont, countRect, &leftF, &mutedBrush);
 
-    // === Search box ===
     g.FillRectangle(&bgBrush, L.searchBox);
     g.DrawRectangle(&borderPen, L.searchBox);
     RectF searchTextRect(L.searchBox.X + 8.0f, L.searchBox.Y, L.searchBox.Width - 16.0f, L.searchBox.Height);
@@ -926,7 +1160,6 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     }
     g_searchBoxRect = L.searchBox;
 
-    // === List area ===
     g.FillRectangle(&bgBrush, L.listArea);
     g.DrawRectangle(&borderPen, L.listArea);
 
@@ -943,7 +1176,19 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
     float fy = static_cast<float>(y);
     int tab = g_activeSubTab;
 
-    // Start resizing on column splitter click
+    if (g_subTabsExpanded) {
+        for (int i = 0; i < 3; ++i) {
+            if (HitTestRect(g_subTabRects[i], fx, fy)) {
+                if (g_activeSubTab != i) {
+                    g_activeSubTab = i;
+                    DoRefresh();
+                    InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
+                }
+                return true;
+            }
+        }
+    }
+
     int resizeCol = GetColumnResizeHit(fx, fy, contentArea);
     if (resizeCol >= 0) {
         g_resizingColIndex = resizeCol;
@@ -957,7 +1202,6 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         return true;
     }
 
-    // Buttons
     if (tab == 0 && fx >= g_btnEndProcess.X && fx <= g_btnEndProcess.X + g_btnEndProcess.Width &&
         fy >= g_btnEndProcess.Y && fy <= g_btnEndProcess.Y + g_btnEndProcess.Height) {
         if (g_selectedProcessIndex >= 0 && g_selectedProcessIndex < (int)g_processes.size()) {
@@ -973,14 +1217,21 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         DoRefresh();
         return true;
     }
-    if (fx >= g_btnAutoRefresh.X && fx <= g_btnAutoRefresh.X + g_btnAutoRefresh.Width &&
-        fy >= g_btnAutoRefresh.Y && fy <= g_btnAutoRefresh.Y + g_btnAutoRefresh.Height) {
-        g_autoRefresh = !g_autoRefresh;
-        InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
+
+    if (g_btnCreate.Width > 0.0f &&
+        fx >= g_btnCreate.X && fx <= g_btnCreate.X + g_btnCreate.Width &&
+        fy >= g_btnCreate.Y && fy <= g_btnCreate.Y + g_btnCreate.Height) {
+        if (tab == 1) {
+            if (ServiceEditDialog::ShowCreate(App::Instance()->GetHWND()))
+                DoRefresh();
+        }
+        else if (tab == 2) {
+            if (StartupEditDialog::ShowCreate(App::Instance()->GetHWND()))
+                DoRefresh();
+        }
         return true;
     }
 
-    // Search box
     if (fx >= g_searchBoxRect.X && fx <= g_searchBoxRect.X + g_searchBoxRect.Width &&
         fy >= g_searchBoxRect.Y && fy <= g_searchBoxRect.Y + g_searchBoxRect.Height) {
         g_searchActive = true;
@@ -990,7 +1241,6 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         g_searchActive = false;
     }
 
-    // Sort by column header
     if (tab == 0) {
         SortColumn col = GetColumnAtHeader(fx, fy, contentArea);
         if (col != SortColumn::None) {
@@ -1001,7 +1251,6 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         }
     }
 
-    // Row click
     if (tab == 0) {
         int row = GetProcessRowAt(fx, fy, contentArea);
         if (row >= 0) {
@@ -1051,13 +1300,12 @@ bool OnTaskManagerMouseMove(int x, int y, const RectF& contentArea) {
         }
         return true;
     }
-    
+
     int resizeCol = GetColumnResizeHit(fx, fy, contentArea);
     if (resizeCol >= 0) {
         SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
         return true;
     }
-
     return false;
 }
 
@@ -1086,7 +1334,7 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         g_selectedProcessIndex = row;
         InvalidateRect(hwnd, nullptr, TRUE);
         if (row >= (int)g_processes.size()) return false;
-        ProcessManager::ProcessInfo proc = g_processes[row];
+        const auto& proc = g_processes[row];
 
         HMENU menu = CreatePopupMenu();
         UINT flags = (proc.pid == 0 || proc.pid == 4) ? MF_GRAYED : MF_STRING;
@@ -1105,7 +1353,7 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         AppendMenuW(prioMenu, MF_STRING, IDM_PROC_PRIORITY_NORMAL, L"Обычный");
         AppendMenuW(prioMenu, MF_STRING, IDM_PROC_PRIORITY_BELOW_NORMAL, L"Ниже обычного");
         AppendMenuW(prioMenu, MF_STRING, IDM_PROC_PRIORITY_LOW, L"Низкий");
-        DWORD currentPriority = ProcessManager::GetProcessPriority(proc.pid);
+        DWORD currentPriority = WinCtrl::Process::GetProcessPriority(proc.pid);
         UINT checkedId = 0;
         switch (currentPriority) {
         case REALTIME_PRIORITY_CLASS:      checkedId = IDM_PROC_PRIORITY_REALTIME; break;
@@ -1118,7 +1366,7 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         if (checkedId) CheckMenuRadioItem(prioMenu, IDM_PROC_PRIORITY_REALTIME, IDM_PROC_PRIORITY_LOW, checkedId, MF_BYCOMMAND);
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)prioMenu, L"Приоритет");
 
-        std::wstring path = proc.fullPath.empty() ? ProcessManager::GetProcessPath(proc.pid) : proc.fullPath;
+        std::wstring path = proc.fullPath.empty() ? WinCtrl::Process::GetImagePath(proc.pid) : proc.fullPath;
         AppendMenuW(menu, path.empty() ? MF_GRAYED : MF_STRING, IDM_PROC_OPEN_LOCATION, L"Открыть расположение файла");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         bool injectEnabled = proc.pid != 0 && proc.pid != 4 && TaskMgr_IsInjectionAllowedByBitness(proc.pid);
@@ -1147,15 +1395,17 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         const auto& svc = g_services[row];
 
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, svc.status == SERVICE_STOPPED ? MF_STRING : MF_GRAYED, IDM_SVC_START, L"Запустить");
-        AppendMenuW(menu, svc.status == SERVICE_RUNNING ? MF_STRING : MF_GRAYED, IDM_SVC_STOP, L"Остановить");
-        AppendMenuW(menu, svc.status == SERVICE_RUNNING ? MF_STRING : MF_GRAYED, IDM_SVC_RESTART, L"Перезапустить");
+        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Stopped ? MF_STRING : MF_GRAYED, IDM_SVC_START, L"Запустить");
+        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Running ? MF_STRING : MF_GRAYED, IDM_SVC_STOP, L"Остановить");
+        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Running ? MF_STRING : MF_GRAYED, IDM_SVC_RESTART, L"Перезапустить");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         HMENU stMenu = CreatePopupMenu();
         AppendMenuW(stMenu, MF_STRING, IDM_SVC_AUTO, L"Автоматически");
         AppendMenuW(stMenu, MF_STRING, IDM_SVC_MANUAL, L"Вручную");
         AppendMenuW(stMenu, MF_STRING, IDM_SVC_DISABLED, L"Отключена");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)stMenu, L"Тип запуска");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_SVC_EDIT, L"Изменить...");
 
         POINT pt{ x, y }; ClientToScreen(hwnd, &pt);
         SetForegroundWindow(hwnd);
@@ -1178,6 +1428,8 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         AppendMenuW(menu, MF_STRING, entry.enabled ? IDM_STARTUP_DISABLE : IDM_STARTUP_ENABLE,
             entry.enabled ? L"Отключить" : L"Включить");
         AppendMenuW(menu, entry.isCritical ? MF_GRAYED : MF_STRING, IDM_STARTUP_REMOVE, L"Удалить");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_STARTUP_EDIT, L"Изменить...");
 
         POINT pt{ x, y }; ClientToScreen(hwnd, &pt);
         SetForegroundWindow(hwnd);
@@ -1189,7 +1441,40 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
     return false;
 }
 
-// Search
+bool OnTaskManagerDblClick(int x, int y, const RectF& contentArea) {
+    if (IsLikelyRecoveryEnvironment()) return false;
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+    int tab = g_activeSubTab;
+    HWND hwnd = App::Instance()->GetHWND();
+
+    if (tab == 1) {
+        int row = GetServiceRowAt(fx, fy, contentArea);
+        if (row >= 0 && row < (int)g_services.size()) {
+            g_selectedServiceIndex = row;
+            if (ServiceEditDialog::ShowEdit(hwnd, g_services[row].name))
+                DoRefresh();
+            return true;
+        }
+    }
+    else if (tab == 2) {
+        int row = GetStartupRowAt(fx, fy, contentArea);
+        if (row >= 0 && row < (int)g_startupEntries.size()) {
+            g_selectedStartupIndex = row;
+            StartupEditDialog::Location loc;
+            if (ResolveStartupLocation(g_startupEntries[row], loc)) {
+                if (StartupEditDialog::ShowEdit(hwnd, loc, g_startupEntries[row].valueName))
+                    DoRefresh();
+            }
+            else {
+                MessageBoxW(hwnd, L"Этот источник нельзя редактировать.", L"Инфо", MB_OK);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool OnTaskManagerKey(UINT msg, WPARAM wParam, LPARAM lParam) {
     (void)lParam;
     if (!g_searchActive) return false;

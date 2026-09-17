@@ -4,6 +4,7 @@
 #include "utils/accounts/account_manager.h"
 #include <string>
 #include <vector>
+#include <algorithm>
 
 using namespace Gdiplus;
 
@@ -13,8 +14,9 @@ static bool g_loaded = false;
 static int g_selected = -1;
 static std::wstring g_offlineLog;
 
-static RectF g_btnRefresh, g_btnCreate, g_btnDelete, g_btnEnable, g_btnPassword, g_btnAdmin;
-static RectF g_btnBackdoor, g_btnRestore;
+// Оставляем только две кнопки: Обновить и Создать
+static RectF g_btnRefresh, g_btnCreate;
+static RectF g_btnBackdoor, g_btnRestore;  // для WinRE
 static std::vector<RectF> g_rowRects;
 static float g_listTop = 0, g_listH = 0;
 static int g_rowCount = 0;
@@ -35,7 +37,7 @@ static void DrawButton(Graphics& g, const RectF& r, const wchar_t* label,
     g.DrawString(label, -1, &f, textRect, &cf, &txt);
 }
 
-// === Auth Dialog (Name / Pass) ===
+// === Auth Dialog (Name / Pass) — без изменений ===
 struct PromptState {
     std::wstring prompt;
     std::wstring result;
@@ -200,42 +202,39 @@ void DrawAccountsContent(Graphics& g, const RectF& contentArea, Font& contentFon
         return;
     }
 
-    // === Omline: buttons 2 x 3 ===
+    // === Online: компактные кнопки (высота 20px, шрифт 10pt) ===
     if (!g_loaded) {
         g_accounts = AccountManager::GetAccounts();
         g_loaded = true;
     }
 
-    const float gap = 10.0f;
-    const float btnH = 34.0f;
-    float availW = contentArea.Width - 20.0f;
-    float btnW = (availW - 2.0f * gap) / 3.0f;
-    if (btnW > 240.0f) btnW = 240.0f;
-    if (btnW < 110.0f) btnW = 110.0f;
+    float btnH = 20.0f;
+    float btnGap = 6.0f;
+    Font smallFont(&ff, 10.0f, FontStyleRegular, UnitPixel);
 
-    float x1 = x;
-    float x2 = x + btnW + gap;
-    float x3 = x + 2.0f * (btnW + gap);
-    float y1 = y;
-    float y2 = y + btnH + gap;
+    // Измеряем текст для ширины кнопок
+    RectF bounds;
+    g.MeasureString(L"Обновить", -1, &smallFont, PointF(0, 0), &bounds);
+    float wRefresh = bounds.Width + 14.0f;
+    if (wRefresh < 60.0f) wRefresh = 60.0f;
+    g.MeasureString(L"Создать", -1, &smallFont, PointF(0, 0), &bounds);
+    float wCreate = bounds.Width + 14.0f;
+    if (wCreate < 60.0f) wCreate = 60.0f;
 
-    g_btnRefresh = RectF(x1, y1, btnW, btnH);
-    g_btnEnable = RectF(x2, y1, btnW, btnH);
-    g_btnPassword = RectF(x3, y1, btnW, btnH);
-    g_btnCreate = RectF(x1, y2, btnW, btnH);
-    g_btnDelete = RectF(x2, y2, btnW, btnH);
-    g_btnAdmin = RectF(x3, y2, btnW, btnH);
+    float totalW = wRefresh + btnGap + wCreate;
+    float btnX = contentArea.X + contentArea.Width - 10.0f - totalW;
+    float btnY = contentArea.Y + 8.0f; // чуть выше, чтобы сэкономить
 
-    DrawButton(g, g_btnRefresh, L"Обновить", font, txt, bg, border);
-    DrawButton(g, g_btnEnable, L"Вкл / Выкл", font, txt, bg, border);
-    DrawButton(g, g_btnPassword, L"Сменить пароль", font, txt, bg, border);
-    DrawButton(g, g_btnCreate, L"Создать", font, txt, bg, border);
-    DrawButton(g, g_btnDelete, L"Удалить", font, txt, bg, border);
-    DrawButton(g, g_btnAdmin, L"Админка", font, txt, bg, border);
+    g_btnRefresh = RectF(btnX, btnY, wRefresh, btnH);
+    g_btnCreate = RectF(btnX + wRefresh + btnGap, btnY, wCreate, btnH);
 
-    y = y2 + btnH + 12.0f;
+    DrawButton(g, g_btnRefresh, L"Обновить", smallFont, txt, bg, border);
+    DrawButton(g, g_btnCreate, L"Создать", smallFont, txt, bg, border);
 
-    // === account List ===
+    // Отступ до списка – минимальный
+    y = btnY + btnH + 6.0f;
+
+    // === Список учётных записей ===
     g_listTop = y;
     g_listH = contentArea.Height - (g_listTop - contentArea.Y) - 8.0f;
     if (g_listH < 10.0f) return;
@@ -274,13 +273,13 @@ void DrawAccountsContent(Graphics& g, const RectF& contentArea, Font& contentFon
     }
 }
 
-// === Buttons ===
+// === Обработка кликов ===
 bool OnAccountsClick(int x, int y, const RectF& contentArea) {
     (void)contentArea;
     float fx = (float)x, fy = (float)y;
     HWND hwnd = App::Instance()->GetHWND();
 
-    // Row selection
+    // Клик по списку (выбор строки)
     for (size_t i = 0; i < g_rowRects.size(); ++i) {
         if (Hit(g_rowRects[i], fx, fy)) {
             int startRow = g_scrollOffset[6] / 20;
@@ -310,7 +309,7 @@ bool OnAccountsClick(int x, int y, const RectF& contentArea) {
         return false;
     }
 
-    // Online
+    // Online: кнопки "Обновить" и "Создать"
     if (Hit(g_btnRefresh, fx, fy)) {
         g_accounts = AccountManager::GetAccounts();
         g_selected = -1;
@@ -335,57 +334,80 @@ bool OnAccountsClick(int x, int y, const RectF& contentArea) {
         return true;
     }
 
-    if (g_selected < 0 || g_selected >= (int)g_accounts.size()) return false;
-    const auto& a = g_accounts[g_selected];
-
-    if (Hit(g_btnDelete, fx, fy)) {
-        if (MessageBoxW(hwnd, (L"Удалить учётную запись \"" + a.name + L"\"?").c_str(),
-            L"Учётные записи", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            if (AccountManager::DeleteAccount(a.name)) {
-                g_accounts = AccountManager::GetAccounts();
-                g_selected = -1;
-            }
-            else {
-                MessageBoxW(hwnd, L"Не удалось удалить учётную запись.",
-                    L"Учётные записи", MB_OK | MB_ICONERROR);
-            }
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return true;
-    }
-    if (Hit(g_btnEnable, fx, fy)) {
-        AccountManager::SetEnabled(a.name, !a.enabled);
-        g_accounts = AccountManager::GetAccounts();
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return true;
-    }
-    if (Hit(g_btnPassword, fx, fy)) {
-        std::wstring pwd;
-        if (Prompt(hwnd, (L"Пароль для " + a.name).c_str(), L"Новый пароль:", pwd, true)) {
-            if (AccountManager::SetPassword(a.name, pwd))
-                MessageBoxW(hwnd, L"Пароль изменён.",
-                    L"Учётные записи", MB_OK | MB_ICONINFORMATION);
-            else
-                MessageBoxW(hwnd, L"Не удалось сменить пароль.",
-                    L"Учётные записи", MB_OK | MB_ICONERROR);
-        }
-        return true;
-    }
-    if (Hit(g_btnAdmin, fx, fy)) {
-        std::wstring msg = a.admin
-            ? L"Убрать учётную запись \"" + a.name + L"\" из администраторов?"
-            : L"Добавить учётную запись \"" + a.name + L"\" в администраторы?";
-        if (MessageBoxW(hwnd, msg.c_str(), L"Учётные записи", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-            AccountManager::SetAdmin(a.name, !a.admin);
-            g_accounts = AccountManager::GetAccounts();
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return true;
-    }
     return false;
 }
 
+// === Контекстное меню (ПКМ) ===
 bool OnAccountsRightClick(int x, int y, const RectF& contentArea) {
-    (void)x; (void)y; (void)contentArea;
-    return false;   // no context menu
+    (void)contentArea;
+    float fx = (float)x, fy = (float)y;
+    HWND hwnd = App::Instance()->GetHWND();
+
+    if (AccountManager::IsWinRE()) {
+        return false; // в оффлайн-режиме нет контекстного меню
+    }
+
+    if (fx < g_listTop || fy < g_listTop || fy > g_listTop + g_listH) return false;
+
+    int row = -1;
+    float rowH = 20.0f;
+    int off = g_scrollOffset[6];
+    float relY = fy - g_listTop - 2.0f + off;
+    int index = (int)(relY / rowH);
+    if (index >= 0 && index < (int)g_accounts.size()) {
+        row = index;
+    }
+    if (row < 0) return false;
+
+    g_selected = row;
+    InvalidateRect(hwnd, nullptr, TRUE);
+
+    const auto& a = g_accounts[row];
+
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"Включить / Выключить");
+    AppendMenuW(menu, MF_STRING, 2, L"Сменить пароль");
+    AppendMenuW(menu, MF_STRING, 3, L"Удалить");
+    AppendMenuW(menu, MF_STRING, 4, a.admin ? L"Убрать из администраторов" : L"Сделать администратором");
+
+    POINT pt{ x, y };
+    ClientToScreen(hwnd, &pt);
+    SetForegroundWindow(hwnd);
+
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+
+    if (cmd) {
+        switch (cmd) {
+        case 1: AccountManager::SetEnabled(a.name, !a.enabled); break;
+        case 2: {
+            std::wstring pwd;
+            if (Prompt(hwnd, (L"Пароль для " + a.name).c_str(), L"Новый пароль:", pwd, true)) {
+                if (AccountManager::SetPassword(a.name, pwd))
+                    MessageBoxW(hwnd, L"Пароль изменён.", L"Учётные записи", MB_OK | MB_ICONINFORMATION);
+                else
+                    MessageBoxW(hwnd, L"Не удалось сменить пароль.", L"Учётные записи", MB_OK | MB_ICONERROR);
+            }
+            break;
+        }
+        case 3:
+            if (MessageBoxW(hwnd, (L"Удалить учётную запись \"" + a.name + L"\"?").c_str(),
+                L"Учётные записи", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                if (AccountManager::DeleteAccount(a.name)) {
+                    g_accounts = AccountManager::GetAccounts();
+                    g_selected = -1;
+                }
+                else {
+                    MessageBoxW(hwnd, L"Не удалось удалить учётную запись.", L"Учётные записи", MB_OK | MB_ICONERROR);
+                }
+            }
+            break;
+        case 4:
+            AccountManager::SetAdmin(a.name, !a.admin);
+            break;
+        }
+        g_accounts = AccountManager::GetAccounts();
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+    return true;
 }

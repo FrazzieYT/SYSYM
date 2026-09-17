@@ -1,54 +1,71 @@
 #pragma once
 #include <windows.h>
 #include <gdiplus.h>
-#include "utils/file_system/file_explorer.h"
 #include <string>
 #include <vector>
-#include "ui/widgets.h"
+#include <array>
+#include "utils/file_system/file_explorer.h"
 
 using namespace Gdiplus;
 
-extern std::vector<Tab> g_tabs;
+// ===== НАВИГАЦИЯ =====
+extern std::vector<std::wstring> g_mainTabs;
+extern int g_activeMainTab;
 extern int g_previousMainTab;
+
+extern int g_activeSubTab;
 extern int g_activeTab;
-extern int g_scrollOffset[7];
-extern int g_maxScroll[7];
-extern std::wstring g_fontFamilyName;
 
-extern std::wstring g_explorerPath;
-extern int g_explorerSelectedIndex;
-extern std::vector<FileExplorer::FileItem> g_explorerItems;
+extern bool g_draggingFromTab;
+extern POINT g_dragStartPoint;
+extern int g_dragTabIndex;
 
+extern bool g_subTabsExpanded;
+extern RectF g_subTabsToggleRect;
+
+// ===== ГОРИЗОНТАЛЬНЫЕ ТАБЫ =====
+extern RectF g_horizontalTabRects[9];
+extern int g_horizontalTabHover;
+
+// ===== СКРОЛЛ КОНТЕНТА =====
+extern int g_scrollOffset[9];
+extern int g_maxScroll[9];
 extern int g_scrollBarWidth;
 extern bool g_scrollBarDragging;
 extern int g_scrollBarDragStartY;
 extern int g_scrollBarDragStartOffset;
 
-extern const Color COLOR_BG;
-extern const Color COLOR_TAB_BG;
-extern const Color COLOR_TAB_ACTIVE;
-extern const Color COLOR_TEXT;
-extern const Color COLOR_TEXT_MUTED;
-extern const Color COLOR_BORDER;
-extern const Color COLOR_BUTTON_BG;
-
-extern std::vector<Button> g_homeButtons;
-
-extern bool g_useVerticalLayout; // true = Vertical layout, false = Tabbed layout
-extern std::vector<std::wstring> g_mainTabs;
-extern std::vector<std::wstring> g_subTabs;
-extern int g_activeMainTab;
-extern int g_activeSubTab;
-extern RectF g_sidebarTabRects[7];
-extern RectF g_subTabRects[10];
-
-extern RectF g_settingsButtonRect;
-extern RectF g_notepadButtonRect;
-
+// ===== КНОПКИ УПРАВЛЕНИЯ ОКНОМ =====
 extern RectF g_tabBtnSettings;
 extern RectF g_tabBtnMinimize;
 extern RectF g_tabBtnClose;
 extern bool g_tabBtnSettingsHover;
 extern bool g_tabBtnMinimizeHover;
 extern bool g_tabBtnCloseHover;
-void InitHomeButtons();
+
+// ===== ДОПОЛНИТЕЛЬНЫЕ КНОПКИ =====
+extern RectF g_settingsButtonRect;
+extern RectF g_notepadButtonRect;
+
+extern std::array<Gdiplus::RectF, 10> g_sidebarTabRects;
+extern std::array<Gdiplus::RectF, 10> g_subTabRects;
+
+// ===== ТЕМА =====
+extern std::wstring g_fontFamilyName;
+extern const Color COLOR_BG;
+extern const Color COLOR_HEADER_BG;
+extern const Color COLOR_TAB_BG;
+extern const Color COLOR_TAB_ACTIVE;
+extern const Color COLOR_TAB_HOVER;
+extern const Color COLOR_TEXT;
+extern const Color COLOR_TEXT_MUTED;
+extern const Color COLOR_BORDER;
+extern const Color COLOR_BUTTON_BG;
+
+// ===== ПРОВОДНИК =====
+extern std::wstring g_explorerPath;
+extern int g_explorerSelectedIndex;
+extern std::vector<FileExplorer::FileItem> g_explorerItems;
+
+// ===== LAYOUT =====
+extern bool g_useVerticalLayout;

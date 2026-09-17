@@ -44,7 +44,7 @@ bool App::Init(HINSTANCE hInstance) {
     // window class
     WNDCLASSEXW wcex = {};
     wcex.cbSize = sizeof(WNDCLASSEXW);
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wcex.lpfnWndProc = MainWndProc;
     wcex.hInstance = m_hInst;
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -84,15 +84,24 @@ int App::Run(int nCmdShow) {
 void App::MinimizeToTray() {
     if (!m_trayAdded) {
         NOTIFYICONDATAW nid = {};
-        nid.cbSize = sizeof(nid);
+        nid.cbSize = sizeof(NOTIFYICONDATAW);
         nid.hWnd = m_hWnd;
         nid.uID = 1;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = (HICON)LoadImageW(m_hInst, MAKEINTRESOURCE(IDI_SYSIM),
             IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+        if (!nid.hIcon) {
+            nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        }
         wcscpy_s(nid.szTip, L"SYSIM Utility");
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+            DWORD err = GetLastError();
+            wchar_t buf[256];
+            wsprintfW(buf, L"Shell_NotifyIcon failed: %lu", err);
+            MessageBoxW(m_hWnd, buf, L"Tray Error", MB_OK);
+            return;
+        }
         m_trayAdded = true;
     }
     ShowWindow(m_hWnd, SW_HIDE);

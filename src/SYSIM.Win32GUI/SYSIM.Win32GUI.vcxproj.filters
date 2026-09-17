@@ -129,15 +129,6 @@
     <ClInclude Include="utils\registry\startup_registry.h">
       <Filter>Utils\registry</Filter>
     </ClInclude>
-    <ClInclude Include="utils\process\dll_injector.h">
-      <Filter>Utils\process</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\process\process_manager.h">
-      <Filter>Utils\process</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\process\service_manager.h">
-      <Filter>Utils\process</Filter>
-    </ClInclude>
     <ClInclude Include="features\unlock.h">
       <Filter>Features</Filter>
     </ClInclude>
@@ -158,6 +149,21 @@
     </ClInclude>
     <ClInclude Include="features\accounts.h">
       <Filter>Features</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\process\dll_injector.h">
+      <Filter>Utils\process</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\process\process_manager.h">
+      <Filter>Utils\process</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\process\service_manager.h">
+      <Filter>Utils\process</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\startup\service_edit_dialog.h">
+      <Filter>Utils\startup</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\startup\startup_edit_dialog.h">
+      <Filter>Utils\startup</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -215,15 +221,6 @@
     <ClCompile Include="utils\registry\startup_registry.cpp">
       <Filter>Utils\registry</Filter>
     </ClCompile>
-    <ClCompile Include="utils\process\dll_injector.cpp">
-      <Filter>Utils\process</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\process\process_manager.cpp">
-      <Filter>Utils\process</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\process\service_manager.cpp">
-      <Filter>Utils\process</Filter>
-    </ClCompile>
     <ClCompile Include="features\unlock.cpp">
       <Filter>Features</Filter>
     </ClCompile>
@@ -244,6 +241,21 @@
     </ClCompile>
     <ClCompile Include="features\accounts.cpp">
       <Filter>Features</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\process\dll_injector.cpp">
+      <Filter>Utils\process</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\process\process_manager.cpp">
+      <Filter>Utils\process</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\process\service_manager.cpp">
+      <Filter>Utils\process</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\startup\service_edit_dialog.cpp">
+      <Filter>Utils\startup</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\startup\startup_edit_dialog.cpp">
+      <Filter>Utils\startup</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

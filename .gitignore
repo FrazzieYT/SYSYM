@@ -19,3 +19,7 @@ Build/
 out/
 *.bak
 SYSIM_report*
+!WinCtrl/
+!WinCtrl/**
+
+src/WinCtrl/

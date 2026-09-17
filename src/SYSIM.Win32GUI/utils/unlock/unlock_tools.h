@@ -72,4 +72,12 @@ namespace UnlockTools {
     BootInfo ScanBoot();
     bool RepairBootRecords(std::wstring& log);
 
+    // Проверка наличия блокировок DisallowRun и IFEO (публичные)
+    bool HasDisallowRunAt(HKEY root, const std::wstring& explorerSubKey);
+    bool HasIFEODebuggerAt(HKEY root, const std::wstring& ifeoSubKey);
+
+    std::vector<std::wstring> ScanDrivesWithWindows();
+    void SetOfflineDriveHint(const std::wstring& driveRoot);
+    std::wstring GetOfflineDriveHint();
+    bool IsRecoveryEnvironment();
 }
