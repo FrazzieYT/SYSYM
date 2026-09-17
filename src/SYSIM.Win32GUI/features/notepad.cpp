@@ -2,6 +2,7 @@
 #include "core/globals.h"
 #include "core/app.h"
 #include "utils/file_system/text_file.h"
+#include <windowsx.h>
 #include <commdlg.h>
 #include <string>
 #include <vector>
@@ -45,6 +46,18 @@ namespace Notepad {
     static HANDLE g_runProc = nullptr;
     static bool g_running = false;
 
+    // Scrollbar state
+    static RectF g_sbTrackEdit;
+    static RectF g_sbThumbEdit;
+    static bool  g_sbDragging = false;
+    static int   g_sbDragStartY = 0;
+    static int   g_sbDragStartLine = 0;
+
+    // Hover тулбара и вкладок
+    static int g_hoverTool = -1;
+    static int g_hoverTab = -1;
+    static int g_hoverX = -1;
+
     enum : int {
         T_NEW = 1, T_OPEN, T_SAVE, T_SAVEAS, T_RUN, T_STOP, T_CLEAR
     };
@@ -52,6 +65,8 @@ namespace Notepad {
     static const float TOOL_H = 34.0f;
     static const float TABS_H = 26.0f;
     static const float OUT_H = 140.0f;
+    static const float SCROLLBAR_W = 10.0f;
+    static const float SCROLLBAR_MIN_THUMB = 28.0f;
 
     // Helpers
     static bool HitRect(const RectF& r, float x, float y) {
@@ -60,6 +75,54 @@ namespace Notepad {
 
     static bool SameRect(const RectF& a, const RectF& b) {
         return a.X == b.X && a.Y == b.Y && a.Width == b.Width && a.Height == b.Height;
+    }
+
+    static void GetEditScrollInfo(HWND hEdit, int& firstLine, int& totalLines, int& visibleLines) {
+        firstLine = (int)SendMessageW(hEdit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        totalLines = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+        visibleLines = 1;
+
+        RECT rc;
+        GetClientRect(hEdit, &rc);
+        HDC hdc = GetDC(hEdit);
+        HFONT hFont = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
+        HFONT hOld = (HFONT)SelectObject(hdc, hFont);
+        TEXTMETRICW tm{};
+        GetTextMetricsW(hdc, &tm);
+        SelectObject(hdc, hOld);
+        ReleaseDC(hEdit, hdc);
+
+        int lineH = tm.tmHeight + tm.tmExternalLeading;
+        if (lineH > 0) {
+            visibleLines = (rc.bottom - rc.top) / lineH;
+            if (visibleLines < 1) visibleLines = 1;
+        }
+    }
+
+    static void FillRounded(Graphics& g, const RectF& r, const Color& c, float rad) {
+        if (rad < 1.0f) { SolidBrush b(c); g.FillRectangle(&b, r); return; }
+        GraphicsPath p;
+        p.AddArc(r.X, r.Y, rad * 2, rad * 2, 180, 90);
+        p.AddArc(r.X + r.Width - rad * 2, r.Y, rad * 2, rad * 2, 270, 90);
+        p.AddArc(r.X + r.Width - rad * 2, r.Y + r.Height - rad * 2, rad * 2, rad * 2, 0, 90);
+        p.AddArc(r.X, r.Y + r.Height - rad * 2, rad * 2, rad * 2, 90, 90);
+        p.CloseFigure();
+        SolidBrush b(c);
+        g.FillPath(&b, &p);
+    }
+
+    static void DrawCloseX(Graphics& g, const RectF& r, const Color& color) {
+        Pen p(color, 1.4f);
+        p.SetStartCap(LineCapRound);
+        p.SetEndCap(LineCapRound);
+        float pad = r.Width * 0.32f;
+        g.DrawLine(&p, r.X + pad, r.Y + pad, r.X + r.Width - pad, r.Y + r.Height - pad);
+        g.DrawLine(&p, r.X + r.Width - pad, r.Y + pad, r.X + pad, r.Y + r.Height - pad);
+    }
+
+    static bool IsMouseBtnDown() {
+        SHORT state = GetAsyncKeyState(VK_LBUTTON);
+        return (state & 0x8000) != 0;
     }
 
     static std::wstring DocTitle(const std::wstring& path) {
@@ -96,16 +159,17 @@ namespace Notepad {
         if (g_parent) InvalidateRect(g_parent, nullptr, FALSE);
     }
 
-    // layout
     static void Layout(const RectF& a) {
         g_lastArea = a;
 
         float top = a.Y + TOOL_H + TABS_H;
         float bottom = a.Y + a.Height;
+        
+        float editW = a.Width - SCROLLBAR_W;
 
         if (g_showOut) {
-            RectF outR(a.X, bottom - OUT_H, a.Width, OUT_H);
-            RectF editR(a.X, top, a.Width, (bottom - OUT_H) - top);
+            RectF outR(a.X, bottom - OUT_H, editW, OUT_H);
+            RectF editR(a.X, top, editW, (bottom - OUT_H) - top);
             if (editR.Height < 0.0f) editR.Height = 0.0f;
 
             if (!SameRect(editR, g_lastEdit)) {
@@ -120,7 +184,7 @@ namespace Notepad {
             }
         }
         else {
-            RectF editR(a.X, top, a.Width, bottom - top);
+            RectF editR(a.X, top, editW, bottom - top);
             if (editR.Height < 0.0f) editR.Height = 0.0f;
 
             if (!SameRect(editR, g_lastEdit)) {
@@ -418,8 +482,8 @@ namespace Notepad {
             FIXED_PITCH | FF_MODERN, L"Consolas");
 
         g_edit = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-            ES_AUTOVSCROLL | ES_NOHIDESEL | ES_LEFT,
+            WS_CHILD | WS_HSCROLL | ES_MULTILINE |
+            ES_NOHIDESEL | ES_LEFT | ES_WANTRETURN,
             0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         g_out = CreateWindowExW(0, L"EDIT", L"",
@@ -471,89 +535,212 @@ namespace Notepad {
 
         FontFamily ff(g_fontFamilyName.c_str());
         Font f(&ff, 11.0f, FontStyleRegular, UnitPixel);
+        Font fSmall(&ff, 10.0f, FontStyleRegular, UnitPixel);
+        Font fIcon(&ff, 12.0f, FontStyleRegular, UnitPixel);
 
-        SolidBrush toolBg(COLOR_TAB_BG);
-        SolidBrush btnBg(COLOR_BUTTON_BG);
         SolidBrush txt(COLOR_TEXT);
+        SolidBrush txtDim(COLOR_TEXT_MUTED);
         Pen border(COLOR_BORDER, 1.0f);
 
-        // Toolbar bar
-        g.FillRectangle(&toolBg, RectF(area.X, area.Y, area.Width, TOOL_H));
-        g.DrawLine(&border, area.X, area.Y + TOOL_H - 1.0f,
-            area.X + area.Width, area.Y + TOOL_H - 1.0f);
-
-        // Document tab bar
-        g.FillRectangle(&toolBg, RectF(area.X, area.Y + TOOL_H, area.Width, TABS_H));
-        g.DrawLine(&border, area.X, area.Y + TOOL_H + TABS_H - 1.0f,
-            area.X + area.Width, area.Y + TOOL_H + TABS_H - 1.0f);
+        const Color BG_BAR(255, 34, 34, 34);
+        const Color BG_BTN(255, 46, 46, 48);
+        const Color BG_BTN_HOVER(255, 60, 60, 64);
+        const Color BG_TAB(255, 42, 42, 44);
+        const Color BG_TAB_HOVER(255, 50, 50, 54);
+        const Color ACCENT(255, 0, 188, 212);
+        const Color DANGER(255, 220, 70, 70);
 
         StringFormat cf;
         cf.SetAlignment(StringAlignmentCenter);
         cf.SetLineAlignment(StringAlignmentCenter);
         cf.SetTrimming(StringTrimmingEllipsisCharacter);
 
-        // Toolbar buttons
+        // ===== Toolbar =====
+        SolidBrush bgBarBrush(BG_BAR);
+        g.FillRectangle(&bgBarBrush, RectF(area.X, area.Y, area.Width, TOOL_H));
+        g.DrawLine(&border, area.X, area.Y + TOOL_H - 1.0f,
+            area.X + area.Width, area.Y + TOOL_H - 1.0f);
+
         g_toolRects.clear();
         g_toolIds.clear();
 
-        struct TD { int id; const wchar_t* text; float w; };
+        struct TD { int id; const wchar_t* icon; const wchar_t* text; float w; };
         const TD defs[] = {
-            { T_NEW,    L"Новый",     70.0f },
-            { T_OPEN,   L"Открыть",   80.0f },
-            { T_SAVE,   L"Сохранить", 90.0f },
-            { T_SAVEAS, L"Как...",    70.0f },
-            { T_RUN,    L"Запуск",    80.0f },
-            { T_STOP,   L"Стоп",      60.0f },
-            { T_CLEAR,  L"Очистить",  80.0f },
+            { T_NEW,    L"✚", L"Новый",     88.0f },
+            { T_OPEN,   L"▤", L"Открыть",  100.0f },
+            { T_SAVE,   L"▼", L"Сохранить", 112.0f },
+            { T_SAVEAS, L"",  L"Как...",    76.0f },
+            { T_RUN,    L"▶", L"Запуск",    92.0f },
+            { T_STOP,   L"■", L"Стоп",      76.0f },
+            { T_CLEAR,  L"✕", L"Очистить",  96.0f },
         };
 
-        float x = area.X + 4.0f;
+        float x = area.X + 6.0f;
+        int idx = 0;
         for (const TD& d : defs) {
-            RectF r(x, area.Y + 4.0f, d.w, TOOL_H - 8.0f);
-            g.FillRectangle(&btnBg, r);
-            g.DrawRectangle(&border, r);
-            g.DrawString(d.text, -1, &f, r, &cf, &txt);
+            RectF r(x, area.Y + 5.0f, d.w, TOOL_H - 10.0f);
+
+            bool hover = (g_hoverTool == idx);
+            bool danger = (d.id == T_STOP);
+            bool accent = (d.id == T_RUN);
+
+            Color bg = hover ? BG_BTN_HOVER : BG_BTN;
+            if (danger && g_running) bg = Color(80, 180, 60, 60);
+            else if (accent && !g_running) bg = Color(60, 30, 90, 80);
+
+            FillRounded(g, r, bg, 5.0f);
+            Pen btnBorder(hover ? ACCENT : COLOR_BORDER, 1.0f);
+            g.DrawRectangle(&btnBorder, r);
+
+            float iconW = (d.icon[0] != 0) ? 20.0f : 0.0f;
+            if (iconW > 0.0f) {
+                RectF ir(r.X + 6.0f, r.Y, iconW, r.Height);
+                SolidBrush ic(danger && g_running ? DANGER :
+                    accent && !g_running ? ACCENT : COLOR_TEXT);
+                g.DrawString(d.icon, -1, &fIcon, ir, &cf, &ic);
+            }
+            RectF tr(r.X + 6.0f + iconW, r.Y, r.Width - 12.0f - iconW, r.Height);
+            StringFormat lf;
+            lf.SetAlignment(StringAlignmentNear);
+            lf.SetLineAlignment(StringAlignmentCenter);
+            lf.SetTrimming(StringTrimmingEllipsisCharacter);
+            g.DrawString(d.text, -1, &fSmall, tr, &lf, &txt);
+
             g_toolRects.push_back(r);
             g_toolIds.push_back(d.id);
             x += d.w + 4.0f;
+            ++idx;
         }
 
-        // Document tabs
+        // ===== Вкладки документов =====
+        g.FillRectangle(&bgBarBrush, RectF(area.X, area.Y + TOOL_H, area.Width, TABS_H));
+
         g_tabRects.clear();
         g_closeRects.clear();
 
-        float ty = area.Y + TOOL_H + 3.0f;
-        float tx = area.X + 4.0f;
+        float ty = area.Y + TOOL_H + 2.0f;
+        float tx = area.X + 6.0f;
+        float tabH = TABS_H - 4.0f;
 
         for (int i = 0; i < (int)g_docs.size(); ++i) {
-            float tw = 150.0f;
-            if (tx + tw > area.X + area.Width - 4.0f) tw = area.X + area.Width - 4.0f - tx;
-            if (tw < 40.0f) break;
+            float tw = 170.0f;
+            if (tx + tw > area.X + area.Width - 6.0f) tw = area.X + area.Width - 6.0f - tx;
+            if (tw < 60.0f) break;
 
-            RectF r(tx, ty, tw - 3.0f, TABS_H - 6.0f);
+            RectF r(tx, ty, tw - 3.0f, tabH);
 
-            SolidBrush tb((i == g_cur) ? COLOR_TAB_ACTIVE : COLOR_BUTTON_BG);
-            g.FillRectangle(&tb, r);
-            g.DrawRectangle(&border, r);
+            bool active = (i == g_cur);
+            bool hover = (g_hoverTab == i);
+
+            Color bg = active ? COLOR_TAB_ACTIVE : (hover ? BG_TAB_HOVER : BG_TAB);
+            FillRounded(g, r, bg, 5.0f);
+
+            if (!active) g.DrawRectangle(&border, r);
 
             std::wstring title = DocTitle(g_docs[i].path);
-            if (g_docs[i].dirty) title += L" *";
 
-            RectF tr(r.X + 6.0f, r.Y, r.Width - 24.0f, r.Height);
-            g.DrawString(title.c_str(), -1, &f, tr, &cf, &txt);
+            float dirtyW = g_docs[i].dirty ? 14.0f : 0.0f;
+            if (g_docs[i].dirty) {
+                SolidBrush db(ACCENT);
+                g.FillEllipse(&db, RectF(r.X + r.Width - 22.0f, r.Y + r.Height / 2 - 3.0f, 6.0f, 6.0f));
+            }
 
-            RectF cr(r.X + r.Width - 18.0f, r.Y + 2.0f, 15.0f, r.Height - 4.0f);
-            g.DrawString(L"\x00D7", -1, &f, cr, &cf, &txt);
+            RectF tr(r.X + 10.0f, r.Y, r.Width - 10.0f - 22.0f - dirtyW, r.Height);
+            StringFormat lf;
+            lf.SetAlignment(StringAlignmentNear);
+            lf.SetLineAlignment(StringAlignmentCenter);
+            lf.SetTrimming(StringTrimmingEllipsisCharacter);
+            g.DrawString(title.c_str(), -1, &fSmall, tr, &lf, &txt);
+
+            bool showX = active || hover || g_hoverX == i;
+            if (showX) {
+                RectF cr(r.X + r.Width - 20.0f, r.Y + r.Height / 2 - 7.0f, 14.0f, 14.0f);
+                DrawCloseX(g, cr, (g_hoverX == i) ? DANGER : COLOR_TEXT_MUTED);
+                g_closeRects.push_back(cr);
+            }
+            else {
+                g_closeRects.push_back(RectF(0, 0, 0, 0));
+            }
 
             g_tabRects.push_back(r);
-            g_closeRects.push_back(cr);
             tx += tw;
+        }
+
+        // ===== СВОЙ СКРОЛЛБАР =====
+        float sbTop = area.Y + TOOL_H + TABS_H;
+        float sbBottom = area.Y + area.Height;
+        if (g_showOut) sbBottom -= OUT_H;
+
+        float sbX = area.X + area.Width - SCROLLBAR_W;
+        float sbH = sbBottom - sbTop;
+        if (sbH <= 4.0f) return;
+
+        g_sbTrackEdit = RectF(sbX, sbTop + 2.0f, SCROLLBAR_W, sbH - 4.0f);
+
+        // Фон трека
+        SolidBrush trackBg(Color(255, 26, 26, 26));
+        g.FillRectangle(&trackBg, g_sbTrackEdit);
+
+        if (!g_edit) return;
+
+        int firstLine = 0, totalLines = 0, visibleLines = 0;
+        GetEditScrollInfo(g_edit, firstLine, totalLines, visibleLines);
+
+        if (totalLines > visibleLines) {
+            float ratio = (float)visibleLines / (float)totalLines;
+            float thumbH = (std::max)(SCROLLBAR_MIN_THUMB, g_sbTrackEdit.Height * ratio);
+            if (thumbH > g_sbTrackEdit.Height) thumbH = g_sbTrackEdit.Height;
+
+            int maxFirst = totalLines - visibleLines;
+            float t = (maxFirst > 0) ? (float)firstLine / (float)maxFirst : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            float thumbY = g_sbTrackEdit.Y + (g_sbTrackEdit.Height - thumbH) * t;
+
+            g_sbThumbEdit = RectF(sbX + 2.0f, thumbY, SCROLLBAR_W - 4.0f, thumbH);
+            
+            Color thumbColor = g_sbDragging ? Color(200, 0, 188, 212)
+                : Color(180, 100, 100, 108);
+            FillRounded(g, g_sbThumbEdit, thumbColor, (SCROLLBAR_W - 4.0f) / 2.0f);
+        }
+        else {
+            g_sbThumbEdit = RectF(0, 0, 0, 0);
         }
     }
 
     // Clicks
     bool OnClick(int x, int y, const RectF& area) {
         float fx = (float)x, fy = (float)y;
+
+        // ===== Скроллбар =====
+        if (g_sbThumbEdit.Width > 0.0f && HitRect(g_sbThumbEdit, fx, fy)) {
+            g_sbDragging = true;
+            g_sbDragStartY = y;
+            int firstLine = 0, total = 0, vis = 0;
+            GetEditScrollInfo(g_edit, firstLine, total, vis);
+            g_sbDragStartLine = firstLine;
+            SetCapture(g_parent);
+            return true;
+        }
+        // Клик по треку - прыжок
+        if (g_sbTrackEdit.Width > 0.0f && HitRect(g_sbTrackEdit, fx, fy)) {
+            int firstLine = 0, total = 0, vis = 0;
+            GetEditScrollInfo(g_edit, firstLine, total, vis);
+            if (total > vis && g_sbThumbEdit.Height > 0.0f) {
+                float usable = g_sbTrackEdit.Height - g_sbThumbEdit.Height;
+                if (usable > 0.0f) {
+                    float rel = (fy - g_sbTrackEdit.Y - g_sbThumbEdit.Height / 2.0f) / usable;
+                    if (rel < 0.0f) rel = 0.0f;
+                    if (rel > 1.0f) rel = 1.0f;
+                    int target = (int)(rel * (total - vis));
+                    int move = target - firstLine;
+                    SendMessageW(g_edit, EM_LINESCROLL, 0, move);
+                    SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, 0);
+                    if (g_parent) InvalidateRect(g_parent, nullptr, FALSE);
+                }
+            }
+            return true;
+        }
 
         for (size_t i = 0; i < g_toolRects.size(); ++i) {
             if (!HitRect(g_toolRects[i], fx, fy)) continue;
@@ -587,6 +774,67 @@ namespace Notepad {
 
         (void)area;
         return false;
+    }
+
+    bool OnMouseMove(int x, int y, const RectF& area) {
+        (void)area;
+        float fx = (float)x, fy = (float)y;
+
+        // Драг скроллбара
+        if (g_sbDragging) {
+            if (!IsMouseBtnDown()) {
+                g_sbDragging = false;
+                ReleaseCapture();
+                return true;
+            }
+            int firstLine, total, vis;
+            GetEditScrollInfo(g_edit, firstLine, total, vis);
+            if (total > vis && g_sbThumbEdit.Height > 0) {
+                float usable = g_sbTrackEdit.Height - g_sbThumbEdit.Height;
+                if (usable > 0) {
+                    int dy = y - g_sbDragStartY;
+                    int lineDelta = (int)((float)dy / usable * (total - vis));
+                    int target = g_sbDragStartLine + lineDelta;
+                    if (target < 0) target = 0;
+                    if (target > total - vis) target = total - vis;
+                    int move = target - firstLine;
+                    SendMessageW(g_edit, EM_LINESCROLL, 0, move);
+                    SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, 0);
+                    if (g_parent) InvalidateRect(g_parent, nullptr, FALSE);
+                }
+            }
+            return true;
+        }
+
+        int newTool = -1, newTab = -1, newX = -1;
+
+        for (size_t i = 0; i < g_toolRects.size(); ++i)
+            if (HitRect(g_toolRects[i], fx, fy)) { newTool = (int)i; break; }
+
+        for (size_t i = 0; i < g_closeRects.size(); ++i) {
+            if (g_closeRects[i].Width <= 0.0f) continue;
+            if (HitRect(g_closeRects[i], fx, fy)) { newX = (int)i; break; }
+        }
+        if (newX < 0) {
+            for (size_t i = 0; i < g_tabRects.size(); ++i)
+                if (HitRect(g_tabRects[i], fx, fy)) { newTab = (int)i; break; }
+        }
+
+        if (newTool != g_hoverTool || newTab != g_hoverTab || newX != g_hoverX) {
+            g_hoverTool = newTool;
+            g_hoverTab = newTab;
+            g_hoverX = newX;
+            if (g_parent) InvalidateRect(g_parent, nullptr, FALSE);
+            return true;
+        }
+        return false;
+    }
+
+    void OnLButtonUp() {
+        if (g_sbDragging) {
+            g_sbDragging = false;
+            ReleaseCapture();
+        }
     }
 
     // Internal

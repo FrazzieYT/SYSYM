@@ -22,6 +22,8 @@ struct Tab {
     RectF bounds;
 };
 
+bool HitTestRect(const RectF& rect, float x, float y);
+
 // Рисование горизонтальных вкладок
 void DrawTabs(Graphics& g, const RectF& clientRect, Font& tabFont, std::vector<Tab>& tabs, int activeTab);
 void DrawWindowButtons(Graphics& g, const RectF& clientRect, Font& font);

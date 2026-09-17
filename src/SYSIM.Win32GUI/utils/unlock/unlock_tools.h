@@ -72,4 +72,8 @@ namespace UnlockTools {
     BootInfo ScanBoot();
     bool RepairBootRecords(std::wstring& log);
 
+    // Проверка наличия блокировок DisallowRun и IFEO (публичные)
+    bool HasDisallowRunAt(HKEY root, const std::wstring& explorerSubKey);
+    bool HasIFEODebuggerAt(HKEY root, const std::wstring& ifeoSubKey);
+
 }

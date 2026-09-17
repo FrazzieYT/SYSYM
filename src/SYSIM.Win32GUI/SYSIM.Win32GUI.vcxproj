@@ -139,6 +139,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);gdiplus.lib</AdditionalDependencies>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -177,6 +178,8 @@
     <ClInclude Include="utils\process\service_manager.h" />
     <ClInclude Include="utils\registry\registry_editor.h" />
     <ClInclude Include="utils\registry\startup_registry.h" />
+    <ClInclude Include="utils\startup\service_edit_dialog.h" />
+    <ClInclude Include="utils\startup\startup_edit_dialog.h" />
     <ClInclude Include="utils\startup\startup_extensions.h" />
     <ClInclude Include="utils\startup\startup_folders.h" />
     <ClInclude Include="utils\startup\startup_system.h" />
@@ -207,6 +210,8 @@
     <ClCompile Include="utils\process\service_manager.cpp" />
     <ClCompile Include="utils\registry\registry_editor.cpp" />
     <ClCompile Include="utils\registry\startup_registry.cpp" />
+    <ClCompile Include="utils\startup\service_edit_dialog.cpp" />
+    <ClCompile Include="utils\startup\startup_edit_dialog.cpp" />
     <ClCompile Include="utils\startup\startup_extensions.cpp" />
     <ClCompile Include="utils\startup\startup_folders.cpp" />
     <ClCompile Include="utils\startup\startup_system.cpp" />

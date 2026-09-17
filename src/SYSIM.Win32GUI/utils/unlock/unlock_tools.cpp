@@ -6,10 +6,12 @@
 #pragma comment(lib, "advapi32.lib")
 
 namespace UnlockTools {
-    static bool DeleteKeyTree(HKEY root, const std::wstring& subKey);
-    namespace {
 
-        // Common helpers
+    // ================================================================
+    // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (detail)
+    // ================================================================
+    namespace detail {
+
         bool EnablePrivilege(const wchar_t* privilegeName) {
             HANDLE hToken = nullptr;
             if (!OpenProcessToken(GetCurrentProcess(),
@@ -65,12 +67,12 @@ namespace UnlockTools {
             return true;
         }
 
-        static std::wstring ToLowerCopy(std::wstring s) {
+        std::wstring ToLowerCopy(std::wstring s) {
             for (wchar_t& c : s) if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
             return s;
         }
 
-        static bool SetDwordAt(HKEY root, const std::wstring& subKey,
+        bool SetDwordAt(HKEY root, const std::wstring& subKey,
             const wchar_t* valueName, DWORD value) {
             HKEY hKey = nullptr;
             if (OpenOnlineKey(root, subKey, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) return false;
@@ -80,7 +82,7 @@ namespace UnlockTools {
             return r == ERROR_SUCCESS;
         }
 
-        static bool SetSzAt(HKEY root, const std::wstring& subKey,
+        bool SetSzAt(HKEY root, const std::wstring& subKey,
             const wchar_t* valueName, const std::wstring& data) {
             HKEY hKey = nullptr;
             if (OpenOnlineKey(root, subKey, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) return false;
@@ -91,7 +93,7 @@ namespace UnlockTools {
             return r == ERROR_SUCCESS;
         }
 
-        static bool DeleteValueAt(HKEY root, const std::wstring& subKey, const wchar_t* valueName) {
+        bool DeleteValueAt(HKEY root, const std::wstring& subKey, const wchar_t* valueName) {
             HKEY hKey = nullptr;
             if (OpenOnlineKey(root, subKey, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) return true;
             RegDeleteValueW(hKey, valueName);
@@ -121,7 +123,6 @@ namespace UnlockTools {
             return false;
         }
 
-        // DisallowRun / IFEO
         bool CleanDisallowRunAt(HKEY root, const std::wstring& explorerSubKey) {
             HKEY hExplorer = nullptr;
             LONG status = OpenOnlineKey(root, explorerSubKey, KEY_SET_VALUE | KEY_QUERY_VALUE, &hExplorer);
@@ -161,58 +162,16 @@ namespace UnlockTools {
             return true;
         }
 
-        bool HasDisallowRunAt(HKEY root, const std::wstring& explorerSubKey) {
-            HKEY hExplorer = nullptr;
-            if (OpenOnlineKey(root, explorerSubKey, KEY_READ, &hExplorer) != ERROR_SUCCESS) return false;
-            bool found = false;
-            DWORD value = 0; DWORD size = sizeof(value); DWORD type = 0;
-            if (RegQueryValueExW(hExplorer, L"DisallowRun", nullptr, &type,
-                reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS) {
-                found = (type != REG_DWORD) || (value != 0);
-            }
-            if (!found) {
-                HKEY hDisallowRun = nullptr;
-                if (RegOpenKeyExW(hExplorer, L"DisallowRun", 0, KEY_READ, &hDisallowRun) == ERROR_SUCCESS) {
-                    wchar_t valueName[16384]{}; DWORD valueNameLen = 16384;
-                    if (RegEnumValueW(hDisallowRun, 0, valueName, &valueNameLen,
-                        nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) found = true;
-                    RegCloseKey(hDisallowRun);
-                }
-            }
-            RegCloseKey(hExplorer);
-            return found;
-        }
-
-        bool HasIFEODebuggerAt(HKEY root, const std::wstring& ifeoSubKey) {
-            HKEY hIFEO = nullptr;
-            if (OpenOnlineKey(root, ifeoSubKey, KEY_ENUMERATE_SUB_KEYS | KEY_READ, &hIFEO) != ERROR_SUCCESS)
-                return false;
-            bool found = false;
-            for (DWORD index = 0;; ++index) {
-                wchar_t subKeyName[1024]{}; DWORD subKeyNameLen = 1024;
-                if (RegEnumKeyExW(hIFEO, index, subKeyName, &subKeyNameLen,
-                    nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                HKEY hSub = nullptr;
-                if (RegOpenKeyExW(hIFEO, subKeyName, 0, KEY_READ, &hSub) == ERROR_SUCCESS) {
-                    if (RegQueryValueExW(hSub, L"Debugger", nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
-                        found = true;
-                    RegCloseKey(hSub);
-                }
-                if (found) break;
-            }
-            RegCloseKey(hIFEO);
-            return found;
-        }
-
         static const wchar_t* kWinlogonKey =
             L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
 
-        static bool IsWinlogonShellHijacked() {
+        bool IsWinlogonShellHijacked() {
             std::wstring shell;
             if (!ReadStringOnline(HKEY_LOCAL_MACHINE, kWinlogonKey, L"Shell", shell)) return false;
             return ToLowerCopy(shell).find(L"explorer.exe") == std::wstring::npos;
         }
-        static bool FixWinlogonShell() {
+
+        bool FixWinlogonShell() {
             bool ok = SetSzAt(HKEY_LOCAL_MACHINE, kWinlogonKey, L"Shell", L"explorer.exe");
             ok = SetSzAt(HKEY_LOCAL_MACHINE, kWinlogonKey, L"Userinit",
                 L"C:\\Windows\\system32\\userinit.exe,") && ok;
@@ -220,19 +179,20 @@ namespace UnlockTools {
             return ok;
         }
 
-        static bool HasLegalNotice() {
+        bool HasLegalNotice() {
             std::wstring s;
             if (ReadStringOnline(HKEY_LOCAL_MACHINE, kWinlogonKey, L"LegalNoticeCaption", s) && !s.empty()) return true;
             if (ReadStringOnline(HKEY_LOCAL_MACHINE, kWinlogonKey, L"LegalNoticeText", s) && !s.empty()) return true;
             return false;
         }
-        static bool ClearLegalNotice() {
+
+        bool ClearLegalNotice() {
             DeleteValueAt(HKEY_LOCAL_MACHINE, kWinlogonKey, L"LegalNoticeCaption");
             DeleteValueAt(HKEY_LOCAL_MACHINE, kWinlogonKey, L"LegalNoticeText");
             return true;
         }
 
-        static bool ReadAssocCommand(std::wstring& out) {
+        bool ReadAssocCommand(std::wstring& out) {
             HKEY hKey = nullptr;
             if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"exefile\\shell\\open\\command", 0,
                 KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -244,12 +204,14 @@ namespace UnlockTools {
             out = buf;
             return true;
         }
-        static bool AreExeAssociationsHijacked() {
+
+        bool AreExeAssociationsHijacked() {
             std::wstring cmd;
             if (!ReadAssocCommand(cmd)) return true;
             return cmd.find(L"%1") == std::wstring::npos;
         }
-        static bool FixExeAssociations() {
+
+        bool FixExeAssociations() {
             struct A { const wchar_t* id; const wchar_t* cmd; };
             static const A items[] = {
                 { L"exefile",  L"\"%1\" %*" },
@@ -276,14 +238,16 @@ namespace UnlockTools {
 
         static const wchar_t* kInetKey =
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-        static bool IsProxyForced() {
+
+        bool IsProxyForced() {
             DWORD v = 0;
             if (ReadDwordOnline(HKEY_CURRENT_USER, kInetKey, L"ProxyEnable", v) && v != 0) return true;
             std::wstring s;
             if (ReadStringOnline(HKEY_CURRENT_USER, kInetKey, L"AutoConfigURL", s) && !s.empty()) return true;
             return false;
         }
-        static bool ResetProxy() {
+
+        bool ResetProxy() {
             SetDwordAt(HKEY_CURRENT_USER, kInetKey, L"ProxyEnable", 0);
             DeleteValueAt(HKEY_CURRENT_USER, kInetKey, L"ProxyServer");
             DeleteValueAt(HKEY_CURRENT_USER, kInetKey, L"AutoConfigURL");
@@ -292,11 +256,13 @@ namespace UnlockTools {
 
         static const wchar_t* kAdvKey =
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
-        static bool AreHiddenFilesForced() {
+
+        bool AreHiddenFilesForced() {
             DWORD v = 0;
             return ReadDwordOnline(HKEY_CURRENT_USER, kAdvKey, L"Hidden", v) && v == 2;
         }
-        static bool RestoreHiddenFiles() {
+
+        bool RestoreHiddenFiles() {
             bool ok = SetDwordAt(HKEY_CURRENT_USER, kAdvKey, L"Hidden", 1);
             ok = SetDwordAt(HKEY_CURRENT_USER, kAdvKey, L"ShowSuperHidden", 1) && ok;
             ok = SetDwordAt(HKEY_CURRENT_USER, kAdvKey, L"HideFileExt", 0) && ok;
@@ -305,25 +271,28 @@ namespace UnlockTools {
 
         static const wchar_t* kWinKey =
             L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
-        static bool HasAppInitDlls() {
+
+        bool HasAppInitDlls() {
             std::wstring s;
             if (ReadStringOnline(HKEY_LOCAL_MACHINE, kWinKey, L"AppInit_DLLs", s) && !s.empty()) return true;
             DWORD v = 0;
             if (ReadDwordOnline(HKEY_LOCAL_MACHINE, kWinKey, L"LoadAppInit_DLLs", v) && v != 0) return true;
             return false;
         }
-        static bool ClearAppInitDlls() {
+
+        bool ClearAppInitDlls() {
             SetSzAt(HKEY_LOCAL_MACHINE, kWinKey, L"AppInit_DLLs", L"");
             SetDwordAt(HKEY_LOCAL_MACHINE, kWinKey, L"LoadAppInit_DLLs", 0);
             return true;
         }
 
-        static bool AreDefenderServicesDisabled() {
+        bool AreDefenderServicesDisabled() {
             DWORD v = 0;
             return ReadDwordOnline(HKEY_LOCAL_MACHINE,
                 L"SYSTEM\\CurrentControlSet\\Services\\WinDefend", L"Start", v) && v == 4;
         }
-        static bool RestoreDefenderServices() {
+
+        bool RestoreDefenderServices() {
             struct S { const wchar_t* name; DWORD start; };
             static const S svc[] = {
                 { L"WinDefend", 2 }, { L"WdNisSvc", 3 }, { L"Sense", 3 },
@@ -338,8 +307,7 @@ namespace UnlockTools {
             return ok;
         }
 
-        // hosts
-        static bool IsHostsHijackedAt(const std::wstring& hostsPath) {
+        bool IsHostsHijackedAt(const std::wstring& hostsPath) {
             HANDLE h = CreateFileW(hostsPath.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
             if (h == INVALID_HANDLE_VALUE) return false;
@@ -364,7 +332,8 @@ namespace UnlockTools {
             }
             return false;
         }
-        static bool WriteDefaultHosts(const std::wstring& hostsPath) {
+
+        bool WriteDefaultHosts(const std::wstring& hostsPath) {
             std::wstring backup = hostsPath + L".bak";
             CopyFileW(hostsPath.c_str(), backup.c_str(), FALSE);
             const char* def =
@@ -382,18 +351,19 @@ namespace UnlockTools {
             CloseHandle(h);
             return true;
         }
-        static bool IsHostsHijacked() {
+
+        bool IsHostsHijacked() {
             wchar_t sysDir[MAX_PATH] = {};
             if (GetSystemDirectoryW(sysDir, MAX_PATH) == 0) return false;
             return IsHostsHijackedAt(std::wstring(sysDir) + L"\\drivers\\etc\\hosts");
         }
-        static bool RestoreDefaultHosts() {
+
+        bool RestoreDefaultHosts() {
             wchar_t sysDir[MAX_PATH] = {};
             if (GetSystemDirectoryW(sysDir, MAX_PATH) == 0) return false;
             return WriteDefaultHosts(std::wstring(sysDir) + L"\\drivers\\etc\\hosts");
         }
 
-        // BCD safeboot (bcdedit)
         bool RunBcdEdit(const std::wstring& args, std::wstring& out) {
             SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
             HANDLE hRead = nullptr, hWrite = nullptr;
@@ -427,25 +397,10 @@ namespace UnlockTools {
             }
             return L"";
         }
+
         std::wstring BcdObject() { return IsLikelyWinRE() ? L"{default}" : L"{current}"; }
 
-    }
-
-    bool IsBcdSafeBootEnabled() {
-        std::wstring out;
-        if (!RunBcdEdit(BcdPrefix() + L"/enum " + BcdObject(), out)) return false;
-        return out.find(L"safeboot") != std::wstring::npos;
-    }
-
-    bool ClearBcdSafeBoot() {
-        std::wstring out;
-        bool ok = RunBcdEdit(BcdPrefix() + L"/deletevalue " + BcdObject() + L" safeboot", out);
-        RunBcdEdit(BcdPrefix() + L"/deletevalue " + BcdObject() + L" safebootalternate", out);
-        return ok;
-    }
-
-    namespace {
-        // Offline
+        // ---- Offline helpers ----
         struct OfflineFix {
             std::wstring subKey;
             std::wstring valueName;
@@ -590,9 +545,69 @@ namespace UnlockTools {
             return blockedCount;
         }
 
+        // ---- Дополнительные утилиты ----
+        bool DeleteKeyTree(HKEY root, const std::wstring& subKey) {
+            HKEY hKey = nullptr;
+            LONG st = RegOpenKeyExW(root, subKey.c_str(), 0, KEY_ALL_ACCESS, &hKey);
+            if (st != ERROR_SUCCESS) return false;
+            RegDeleteTreeW(hKey, nullptr);
+            RegCloseKey(hKey);
+            LONG r = RegDeleteKeyW(root, subKey.c_str());
+            return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+        }
+
+        bool RunCapture(const std::wstring& command, std::wstring& log) {
+            SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+            HANDLE hRead = nullptr, hWrite = nullptr;
+            if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
+            SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+            STARTUPINFOW si{}; si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+            si.wShowWindow = SW_HIDE;
+            si.hStdOutput = hWrite; si.hStdError = hWrite;
+            PROCESS_INFORMATION pi{};
+            std::wstring cmd = command;
+            BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+            CloseHandle(hWrite);
+            if (!ok) { CloseHandle(hRead); log += L"[ошибка запуска] " + command + L"\r\n"; return false; }
+            std::string acc; char buf[4096]; DWORD rd = 0;
+            while (ReadFile(hRead, buf, sizeof(buf), &rd, nullptr) && rd > 0) acc.append(buf, rd);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hRead);
+            int wn = MultiByteToWideChar(CP_OEMCP, 0, acc.c_str(), (int)acc.size(), nullptr, 0);
+            std::wstring ws(wn > 0 ? wn : 0, 0);
+            if (wn > 0) MultiByteToWideChar(CP_OEMCP, 0, acc.c_str(), (int)acc.size(), &ws[0], wn);
+            log += L"> " + command + L"\r\n" + ws + L"\r\n";
+            return code == 0;
+        }
+
+        bool FileExistsPath(const std::wstring& p) {
+            return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+
+    } // namespace detail
+
+    // ================================================================
+    // ПУБЛИЧНЫЕ ФУНКЦИИ
+    // ================================================================
+
+    // ----- BCD -----
+    bool IsBcdSafeBootEnabled() {
+        std::wstring out;
+        if (!detail::RunBcdEdit(detail::BcdPrefix() + L"/enum " + detail::BcdObject(), out)) return false;
+        return out.find(L"safeboot") != std::wstring::npos;
     }
 
-    // Policy list (online)
+    bool ClearBcdSafeBoot() {
+        std::wstring out;
+        bool ok = detail::RunBcdEdit(detail::BcdPrefix() + L"/deletevalue " + detail::BcdObject() + L" safeboot", out);
+        detail::RunBcdEdit(detail::BcdPrefix() + L"/deletevalue " + detail::BcdObject() + L" safebootalternate", out);
+        return ok;
+    }
+
+    // ----- Список ограничений -----
     std::vector<Restriction> GetKnownRestrictions() {
         std::vector<Restriction> list;
         auto add = [&](const std::wstring& description, const std::vector<HKEY>& hives,
@@ -673,10 +688,11 @@ namespace UnlockTools {
         return list;
     }
 
+    // ----- Проверка и снятие блокировок -----
     bool IsRestricted(const Restriction& r) {
         for (HKEY hive : r.hives) {
             DWORD value = 0;
-            if (ReadDwordOnline(hive, r.subKey, r.valueName, value)) {
+            if (detail::ReadDwordOnline(hive, r.subKey, r.valueName, value)) {
                 if (value != r.disableValue) return true;
             }
         }
@@ -687,7 +703,7 @@ namespace UnlockTools {
         bool ok = true;
         for (HKEY hive : r.hives) {
             HKEY hKey = nullptr;
-            LONG status = OpenOnlineKey(hive, r.subKey, KEY_SET_VALUE, &hKey);
+            LONG status = detail::OpenOnlineKey(hive, r.subKey, KEY_SET_VALUE, &hKey);
             if (status != ERROR_SUCCESS) {
                 if (status != ERROR_FILE_NOT_FOUND) ok = false;
                 continue;
@@ -708,27 +724,27 @@ namespace UnlockTools {
 
     bool ClearDisallowRun() {
         bool ok = true;
-        ok &= CleanDisallowRunAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
-        ok &= CleanDisallowRunAt(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        ok &= detail::CleanDisallowRunAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        ok &= detail::CleanDisallowRunAt(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
         return ok;
     }
 
     bool ClearImageFileExecutionOptions() {
-        return CleanIFEOAt(HKEY_LOCAL_MACHINE,
+        return detail::CleanIFEOAt(HKEY_LOCAL_MACHINE,
             L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
     }
-    
-    // Offline repair
+
+    // ----- Offline -----
     bool RepairOfflineWindows() {
-        EnableOfflinePrivileges();
-        std::wstring winDrive = FindOfflineWindowsDrive();
+        detail::EnableOfflinePrivileges();
+        std::wstring winDrive = detail::FindOfflineWindowsDrive();
         if (winDrive.empty()) return false;
         std::wstring softwarePath = winDrive + L"Windows\\System32\\config\\SOFTWARE";
         HKEY hSoft = nullptr;
         if (RegLoadAppKeyW(softwarePath.c_str(), &hSoft, KEY_ALL_ACCESS, 0, 0) != ERROR_SUCCESS)
             return false;
 
-        std::vector<OfflineFix> softwareFixes = {
+        std::vector<detail::OfflineFix> softwareFixes = {
             { L"Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"DisableTaskMgr", 0, false },
             { L"Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"DisableRegistryTools", 0, false },
             { L"Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"EnableLUA", 1, false },
@@ -746,7 +762,7 @@ namespace UnlockTools {
             { L"Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"Taskman", 0, true },
             { L"Microsoft\\Windows NT\\CurrentVersion\\Windows", L"LoadAppInit_DLLs", 0, false },
         };
-        for (const auto& fix : softwareFixes) ApplyOfflineFix(hSoft, fix);
+        for (const auto& fix : softwareFixes) detail::ApplyOfflineFix(hSoft, fix);
         {
             HKEY hWl = nullptr;
             if (RegOpenKeyExW(hSoft, L"Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 0,
@@ -762,10 +778,10 @@ namespace UnlockTools {
                 RegCloseKey(hWl);
             }
         }
-        CleanDisallowRunAt(hSoft, L"Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
-        CleanIFEOAt(hSoft, L"Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
+        detail::CleanDisallowRunAt(hSoft, L"Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        detail::CleanIFEOAt(hSoft, L"Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
 
-        std::vector<OfflineFix> userFixes = {
+        std::vector<detail::OfflineFix> userFixes = {
             { L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"DisableTaskMgr", 0, false },
             { L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"DisableRegistryTools", 0, false },
             { L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"DisableLockWorkstation", 0, false },
@@ -790,9 +806,9 @@ namespace UnlockTools {
             { L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", L"ProxyEnable", 0, false },
         };
         std::wstring usersDir = winDrive + L"Users";
-        ForEachUserHive(usersDir, [&](HKEY hUser) {
-            for (const auto& fix : userFixes) ApplyOfflineFix(hUser, fix);
-            CleanDisallowRunAt(hUser, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        detail::ForEachUserHive(usersDir, [&](HKEY hUser) {
+            for (const auto& fix : userFixes) detail::ApplyOfflineFix(hUser, fix);
+            detail::CleanDisallowRunAt(hUser, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
             });
 
         std::wstring systemPath = winDrive + L"Windows\\System32\\config\\SYSTEM";
@@ -804,20 +820,18 @@ namespace UnlockTools {
                 { L"SecurityHealthService", 2 }, { L"wscsvc", 2 },
             };
             for (const auto& s : svcFixes) {
-                ApplyOfflineFix(hSys,
+                detail::ApplyOfflineFix(hSys,
                     { std::wstring(L"ControlSet001\\Services\\") + s.name, L"Start", s.start, false });
             }
             RegFlushKey(hSys);
             RegCloseKey(hSys);
         }
 
-        // hosts offline
         std::wstring hostsPath = winDrive + L"Windows\\System32\\drivers\\etc\\hosts";
-        if (IsHostsHijackedAt(hostsPath)) WriteDefaultHosts(hostsPath);
+        if (detail::IsHostsHijackedAt(hostsPath)) detail::WriteDefaultHosts(hostsPath);
 
-        // SRP / AppLocker in offline hive
-        DeleteKeyTree(hSoft, L"Policies\\Microsoft\\Windows\\Safer");
-        DeleteKeyTree(hSoft, L"Policies\\Microsoft\\Windows\\SrpV2");
+        detail::DeleteKeyTree(hSoft, L"Policies\\Microsoft\\Windows\\Safer");
+        detail::DeleteKeyTree(hSoft, L"Policies\\Microsoft\\Windows\\SrpV2");
 
         RegFlushKey(hSoft);
         RegCloseKey(hSoft);
@@ -825,40 +839,40 @@ namespace UnlockTools {
     }
 
     bool ClearOfflineIFEO() {
-        EnableOfflinePrivileges();
-        std::wstring winDrive = FindOfflineWindowsDrive();
+        detail::EnableOfflinePrivileges();
+        std::wstring winDrive = detail::FindOfflineWindowsDrive();
         if (winDrive.empty()) return false;
         HKEY hSoft = nullptr;
         if (RegLoadAppKeyW((winDrive + L"Windows\\System32\\config\\SOFTWARE").c_str(),
             &hSoft, KEY_ALL_ACCESS, 0, 0) != ERROR_SUCCESS) return false;
-        CleanIFEOAt(hSoft, L"Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
+        detail::CleanIFEOAt(hSoft, L"Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
         RegFlushKey(hSoft); RegCloseKey(hSoft);
         return true;
     }
 
     bool ClearOfflineDisallowRun() {
-        EnableOfflinePrivileges();
-        std::wstring winDrive = FindOfflineWindowsDrive();
+        detail::EnableOfflinePrivileges();
+        std::wstring winDrive = detail::FindOfflineWindowsDrive();
         if (winDrive.empty()) return false;
         HKEY hSoft = nullptr;
         if (RegLoadAppKeyW((winDrive + L"Windows\\System32\\config\\SOFTWARE").c_str(),
             &hSoft, KEY_ALL_ACCESS, 0, 0) == ERROR_SUCCESS) {
-            CleanDisallowRunAt(hSoft, L"Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+            detail::CleanDisallowRunAt(hSoft, L"Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
             RegFlushKey(hSoft); RegCloseKey(hSoft);
         }
-        ForEachUserHive(winDrive + L"Users", [&](HKEY hUser) {
-            CleanDisallowRunAt(hUser, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        detail::ForEachUserHive(winDrive + L"Users", [&](HKEY hUser) {
+            detail::CleanDisallowRunAt(hUser, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
             });
         return true;
     }
 
-    // Main report
+    // ----- Основной отчёт -----
     std::wstring GetBestUnlockReport(bool unlock) {
         std::wstring body;
         int blockedCount = 0, unlockedCount = 0, failedCount = 0;
         bool completed = false;
 
-        int offlineBlocked = ScanOfflineWindows(body);
+        int offlineBlocked = detail::ScanOfflineWindows(body);
         if (offlineBlocked >= 0) {
             blockedCount += offlineBlocked;
             if (offlineBlocked == 0) body += L"Offline: активные блокировки не найдены.\r\n";
@@ -886,7 +900,6 @@ namespace UnlockTools {
                 else { body += L"Ошибка: " + r.description + L"\r\n"; ++failedCount; }
             }
 
-            // SRP / AppLocker
             PolicyLocks pl = ScanPolicyLocks();
             if (pl.srp) {
                 ++blockedCount;
@@ -933,15 +946,15 @@ namespace UnlockTools {
 
             struct ActionItem { const wchar_t* desc; bool (*detect)(); bool (*fix)(); bool counts; };
             static const ActionItem kActions[] = {
-                { L"Winlogon: подменён Shell",           IsWinlogonShellHijacked,    FixWinlogonShell,      true  },
-                { L"Баннер входа (LegalNotice)",         HasLegalNotice,             ClearLegalNotice,      true  },
-                { L"Ассоциации EXE/BAT/CMD",             AreExeAssociationsHijacked, FixExeAssociations,    true  },
-                { L"Принудительный прокси",              IsProxyForced,              ResetProxy,            true  },
+                { L"Winlogon: подменён Shell",           detail::IsWinlogonShellHijacked,    detail::FixWinlogonShell,      true  },
+                { L"Баннер входа (LegalNotice)",         detail::HasLegalNotice,             detail::ClearLegalNotice,      true  },
+                { L"Ассоциации EXE/BAT/CMD",             detail::AreExeAssociationsHijacked, detail::FixExeAssociations,    true  },
+                { L"Принудительный прокси",              detail::IsProxyForced,              detail::ResetProxy,            true  },
                 { L"Скрытые файлы не показываются (Исправление включит показ)",
-                                                         AreHiddenFilesForced,       RestoreHiddenFiles,    false },
-                { L"AppInit_DLLs (инжекция в процессы)", HasAppInitDlls,             ClearAppInitDlls,      true  },
-                { L"Службы Defender отключены",          AreDefenderServicesDisabled,RestoreDefenderServices,true },
-                { L"Файл hosts содержит сторонние записи", IsHostsHijacked,          RestoreDefaultHosts,   false },
+                                                         detail::AreHiddenFilesForced,       detail::RestoreHiddenFiles,    false },
+                { L"AppInit_DLLs (инжекция в процессы)", detail::HasAppInitDlls,             detail::ClearAppInitDlls,      true  },
+                { L"Службы Defender отключены",          detail::AreDefenderServicesDisabled,detail::RestoreDefenderServices,true },
+                { L"Файл hosts содержит сторонние записи", detail::IsHostsHijacked,          detail::RestoreDefaultHosts,   false },
             };
             for (const auto& a : kActions) {
                 if (!a.detect()) continue;
@@ -972,49 +985,7 @@ namespace UnlockTools {
         return header + body;
     }
 
-    // Common helpers for new blocks
-    static bool DeleteKeyTree(HKEY root, const std::wstring& subKey) {
-        HKEY hKey = nullptr;
-        LONG st = RegOpenKeyExW(root, subKey.c_str(), 0, KEY_ALL_ACCESS, &hKey);
-        if (st != ERROR_SUCCESS) return false;
-        RegDeleteTreeW(hKey, nullptr);
-        RegCloseKey(hKey);
-        LONG r = RegDeleteKeyW(root, subKey.c_str());
-        return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
-    }
-
-    static bool RunCapture(const std::wstring& command, std::wstring& log) {
-        SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-        HANDLE hRead = nullptr, hWrite = nullptr;
-        if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
-        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
-        STARTUPINFOW si{}; si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-        si.wShowWindow = SW_HIDE;
-        si.hStdOutput = hWrite; si.hStdError = hWrite;
-
-        PROCESS_INFORMATION pi{};
-        std::wstring cmd = command;
-        BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-        CloseHandle(hWrite);
-        if (!ok) { CloseHandle(hRead); log += L"[ошибка запуска] " + command + L"\r\n"; return false; }
-
-        std::string acc; char buf[4096]; DWORD rd = 0;
-        while (ReadFile(hRead, buf, sizeof(buf), &rd, nullptr) && rd > 0) acc.append(buf, rd);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hRead);
-
-        int wn = MultiByteToWideChar(CP_OEMCP, 0, acc.c_str(), (int)acc.size(), nullptr, 0);
-        std::wstring ws(wn > 0 ? wn : 0, 0);
-        if (wn > 0) MultiByteToWideChar(CP_OEMCP, 0, acc.c_str(), (int)acc.size(), &ws[0], wn);
-        log += L"> " + command + L"\r\n" + ws + L"\r\n";
-        return code == 0;
-    }
-
-    // SRP / AppLocker
+    // ----- SRP / AppLocker -----
     PolicyLocks ScanPolicyLocks() {
         PolicyLocks r;
         HKEY h = nullptr;
@@ -1048,7 +1019,6 @@ namespace UnlockTools {
             RegCloseKey(h);
         }
 
-        // AppLocker
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
             L"SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2", 0, KEY_READ, &h) == ERROR_SUCCESS) {
             r.applocker = true;
@@ -1070,11 +1040,11 @@ namespace UnlockTools {
     }
 
     void UnlockPolicyLocks() {
-        DeleteKeyTree(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Safer");
-        DeleteKeyTree(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2");
+        detail::DeleteKeyTree(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\Safer");
+        detail::DeleteKeyTree(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\SrpV2");
     }
 
-    // NTFS ACL
+    // ----- NTFS ACL -----
     std::vector<AclProbe> ProbeCriticalPaths() {
         std::vector<AclProbe> out;
         std::vector<std::wstring> paths;
@@ -1102,32 +1072,28 @@ namespace UnlockTools {
     }
 
     bool ResetAclOnPath(const std::wstring& path, bool recursive, std::wstring& log) {
-        EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
-        EnablePrivilege(SE_BACKUP_NAME);
-        EnablePrivilege(SE_RESTORE_NAME);
+        detail::EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+        detail::EnablePrivilege(SE_BACKUP_NAME);
+        detail::EnablePrivilege(SE_RESTORE_NAME);
 
         std::wstring q = L"\"" + path + L"\"";
-        RunCapture(L"cmd.exe /c takeown /f " + q + L" /a /d y" + (recursive ? L" /r" : L""), log);
-        RunCapture(L"cmd.exe /c icacls " + q + L" /reset" + (recursive ? L" /t" : L"") + L" /c /q", log);
+        detail::RunCapture(L"cmd.exe /c takeown /f " + q + L" /a /d y" + (recursive ? L" /r" : L""), log);
+        detail::RunCapture(L"cmd.exe /c icacls " + q + L" /reset" + (recursive ? L" /t" : L"") + L" /c /q", log);
         return true;
     }
 
-    // Boot
-    static bool FileExistsPath(const std::wstring& p) {
-        return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
-
+    // ----- Загрузка (boot) -----
     BootInfo ScanBoot() {
         BootInfo b;
 
         wchar_t sd[16] = {};
-        bool inRE = GetEnvironmentVariableW(L"SystemDrive", sd, 16) > 0 && _wcsicmp(sd, L"X:") == 0;
+        bool inRE = detail::IsLikelyWinRE();
         std::wstring drv;
-        if (inRE) drv = FindOfflineWindowsDrive();
+        if (inRE) drv = detail::FindOfflineWindowsDrive();
         if (drv.empty()) {
             wchar_t win[MAX_PATH] = {};
             if (GetWindowsDirectoryW(win, MAX_PATH)) {
-                drv = std::wstring(win, 3); // "C:\"
+                drv = std::wstring(win, 3);
                 b.windowsDir = win;
             }
         }
@@ -1137,11 +1103,11 @@ namespace UnlockTools {
 
         if (!b.windowsDir.empty()) {
             b.winloadOk =
-                FileExistsPath(b.windowsDir + L"\\System32\\winload.exe") ||
-                FileExistsPath(b.windowsDir + L"\\System32\\winload.efi");
+                detail::FileExistsPath(b.windowsDir + L"\\System32\\winload.exe") ||
+                detail::FileExistsPath(b.windowsDir + L"\\System32\\winload.efi");
         }
-        b.biosBcdOk = FileExistsPath(drv + L"Boot\\BCD");
-        b.efiBcdOk = FileExistsPath(drv + L"EFI\\Microsoft\\Boot\\BCD");
+        b.biosBcdOk = detail::FileExistsPath(drv + L"Boot\\BCD");
+        b.efiBcdOk = detail::FileExistsPath(drv + L"EFI\\Microsoft\\Boot\\BCD");
 
         std::wstring log;
         std::wstring enumCmd = (inRE && b.efiBcdOk)
@@ -1149,60 +1115,119 @@ namespace UnlockTools {
             : (inRE && b.biosBcdOk)
             ? L"bcdedit /store \"" + drv + L"Boot\\BCD\" /enum {default}"
             : L"bcdedit /enum {current}";
-        b.bcdeditOk = RunCapture(enumCmd, log);
+        b.bcdeditOk = detail::RunCapture(enumCmd, log);
         b.details = log;
         return b;
     }
 
     bool RepairBootRecords(std::wstring& log) {
-        EnableOfflinePrivileges();
-        RunCapture(L"bootrec /fixmbr", log);
-        RunCapture(L"bootrec /fixboot", log);
-        RunCapture(L"bootrec /scanos", log);
-        
+        detail::EnableOfflinePrivileges();
+        detail::RunCapture(L"bootrec /fixmbr", log);
+        detail::RunCapture(L"bootrec /fixboot", log);
+        detail::RunCapture(L"bootrec /scanos", log);
+
         BootInfo bi = ScanBoot();
         if (!bi.efiBcdOk && !bi.windowsDir.empty()) {
-            RunCapture(L"bcdboot \"" + bi.windowsDir + L"\" /l ru-ru", log);
+            detail::RunCapture(L"bcdboot \"" + bi.windowsDir + L"\" /l ru-ru", log);
         }
         return true;
     }
 
-    // Legacy
+    // ----- Legacy -----
     bool IsRegistryEditorLocked() {
         DWORD value = 0;
-        if (ReadDwordOnline(HKEY_CURRENT_USER,
+        if (detail::ReadDwordOnline(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"DisableRegistryTools", value)) return value != 0;
         return false;
     }
+
     bool UnlockRegistryEditor() {
-        return SetDwordAt(HKEY_CURRENT_USER,
+        return detail::SetDwordAt(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"DisableRegistryTools", 0);
     }
+
     bool IsTaskManagerLocked() {
         DWORD value = 0;
-        if (ReadDwordOnline(HKEY_CURRENT_USER,
+        if (detail::ReadDwordOnline(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"DisableTaskMgr", value)) return value != 0;
         return false;
     }
+
     bool UnlockTaskManager() {
-        return SetDwordAt(HKEY_CURRENT_USER,
+        return detail::SetDwordAt(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"DisableTaskMgr", 0);
     }
+
     bool IsUACDisabled() {
         DWORD value = 1;
-        if (ReadDwordOnline(HKEY_LOCAL_MACHINE,
+        if (detail::ReadDwordOnline(HKEY_LOCAL_MACHINE,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"EnableLUA", value)) return value == 0;
         return false;
     }
+
     bool EnableUAC() {
-        return SetDwordAt(HKEY_LOCAL_MACHINE,
+        return detail::SetDwordAt(HKEY_LOCAL_MACHINE,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             L"EnableLUA", 1);
     }
 
-}
+    // ================================================================
+    // ПУБЛИЧНЫЕ ФУНКЦИИ ДЛЯ ПРОВЕРКИ DisallowRun И IFEO
+    // (без зависимости от detail::OpenOnlineKey)
+    // ================================================================
+    bool HasDisallowRunAt(HKEY root, const std::wstring& explorerSubKey) {
+        HKEY hExplorer = nullptr;
+        LONG status = RegOpenKeyExW(root, explorerSubKey.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &hExplorer);
+        if (status != ERROR_SUCCESS)
+            status = RegOpenKeyExW(root, explorerSubKey.c_str(), 0, KEY_READ, &hExplorer);
+        if (status != ERROR_SUCCESS) return false;
+
+        bool found = false;
+        DWORD value = 0; DWORD size = sizeof(value); DWORD type = 0;
+        if (RegQueryValueExW(hExplorer, L"DisallowRun", nullptr, &type,
+            reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS) {
+            found = (type != REG_DWORD) || (value != 0);
+        }
+        if (!found) {
+            HKEY hDisallowRun = nullptr;
+            if (RegOpenKeyExW(hExplorer, L"DisallowRun", 0, KEY_READ, &hDisallowRun) == ERROR_SUCCESS) {
+                wchar_t valueName[16384]{}; DWORD valueNameLen = 16384;
+                if (RegEnumValueW(hDisallowRun, 0, valueName, &valueNameLen,
+                    nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) found = true;
+                RegCloseKey(hDisallowRun);
+            }
+        }
+        RegCloseKey(hExplorer);
+        return found;
+    }
+
+    bool HasIFEODebuggerAt(HKEY root, const std::wstring& ifeoSubKey) {
+        HKEY hIFEO = nullptr;
+        LONG status = RegOpenKeyExW(root, ifeoSubKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | KEY_READ | KEY_WOW64_64KEY, &hIFEO);
+        if (status != ERROR_SUCCESS)
+            status = RegOpenKeyExW(root, ifeoSubKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | KEY_READ, &hIFEO);
+        if (status != ERROR_SUCCESS) return false;
+
+        bool found = false;
+        for (DWORD index = 0;; ++index) {
+            wchar_t subKeyName[1024]{}; DWORD subKeyNameLen = 1024;
+            if (RegEnumKeyExW(hIFEO, index, subKeyName, &subKeyNameLen,
+                nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            HKEY hSub = nullptr;
+            if (RegOpenKeyExW(hIFEO, subKeyName, 0, KEY_READ, &hSub) == ERROR_SUCCESS) {
+                if (RegQueryValueExW(hSub, L"Debugger", nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+                    found = true;
+                RegCloseKey(hSub);
+            }
+            if (found) break;
+        }
+        RegCloseKey(hIFEO);
+        return found;
+    }
+
+} // namespace UnlockTools

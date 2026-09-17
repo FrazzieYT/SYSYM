@@ -6,19 +6,27 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <vector>
 
 using namespace Gdiplus;
 
+// --- Глобальные состояния ---
 static bool g_immediateUnlock = true;
 static bool g_fixBcdSafeBoot = false;
+static bool g_fixAcl = false;
+static bool g_fixBoot = false;
 
-static RectF g_checkboxRect;
-static RectF g_bcdCheckboxRect;
-static RectF g_buttonRect;
-static RectF g_aclButtonRect;
-static RectF g_bootButtonRect;
-static std::wstring g_lastReport;
+// Прямоугольники для интерактивных элементов
+static RectF g_checkboxRect;        // "Разблок."
+static RectF g_bcdCheckboxRect;     // "BCD safeboot"
+static RectF g_aclCheckboxRect;     // "ACL"
+static RectF g_bootCheckboxRect;    // "Boot"
+static RectF g_buttonRect;          // Кнопка "Выполнить"
+static RectF g_refreshButtonRect;   // Кнопка "Обновить"
 
+static std::wstring g_lastReport;   // Текст отчёта / лога
+
+// Вспомогательные функции
 static bool HitTestRect(const RectF& rect, float x, float y) {
     return x >= rect.X && x < rect.X + rect.Width &&
         y >= rect.Y && y < rect.Y + rect.Height;
@@ -40,7 +48,7 @@ static void DrawCheckbox(
     leftFormat.SetAlignment(StringAlignmentNear);
     leftFormat.SetLineAlignment(StringAlignmentCenter);
     g.DrawString(label, -1, &font,
-        RectF(boxRect.X + 28.0f, boxRect.Y - 6.0f, 460.0f, 30.0f),
+        RectF(boxRect.X + 24.0f, boxRect.Y - 4.0f, 120.0f, 24.0f),
         &leftFormat, &textBrush);
 }
 
@@ -56,7 +64,7 @@ static void DrawButton(
     g.DrawString(label, -1, &font, r, &cf, &textBrush);
 }
 
-// Render Unlock tab
+// --- Основная функция рисования ---
 void DrawUnlockContent(Graphics& g, const RectF& contentArea, Font& contentFont) {
     (void)contentFont;
 
@@ -65,49 +73,68 @@ void DrawUnlockContent(Graphics& g, const RectF& contentArea, Font& contentFont)
     }
 
     float x = contentArea.X + 10.0f;
-    float y = contentArea.Y + 12.0f;
+    float y = contentArea.Y + 8.0f;
 
     FontFamily ff(g_fontFamilyName.c_str());
-    Font font(&ff, 12.5f, FontStyleRegular, UnitPixel);
+    Font font(&ff, 11.0f, FontStyleRegular, UnitPixel);        // для чекбоксов
+    Font smallFont(&ff, 10.5f, FontStyleRegular, UnitPixel);   // для кнопок
     SolidBrush textBrush(COLOR_TEXT);
     SolidBrush controlBg(COLOR_BUTTON_BG);
     SolidBrush checkBrush(COLOR_TEXT);
     Pen borderPen(COLOR_BORDER, 1.0f);
 
-    // Unlock immediately
-    RectF boxRect(x, y, 18.0f, 18.0f);
-    g_checkboxRect = RectF(x - 4.0f, y - 6.0f, 460.0f, 30.0f);
-    DrawCheckbox(g, boxRect, g_immediateUnlock,
-        L"Сразу разблокировать и вывести",
+    // ---- Чекбоксы в одну строку ----
+    // Распределяем по ширине: 4 чекбокса + отступы
+    float checkboxW = 120.0f;
+    float checkboxGap = 8.0f;
+    float totalCheckW = checkboxW * 4 + checkboxGap * 3;
+    float startX = x;
+
+    // Чекбокс 1: "Разблок."
+    RectF boxRect1(startX, y, 16.0f, 16.0f);
+    g_checkboxRect = RectF(startX - 4.0f, y - 4.0f, checkboxW, 24.0f);
+    DrawCheckbox(g, boxRect1, g_immediateUnlock, L"Разблок.",
         font, textBrush, controlBg, borderPen, checkBrush);
 
-    // BCD safeboot
-    float bcdY = y + 30.0f;
-    RectF bcdBox(x, bcdY, 18.0f, 18.0f);
-    g_bcdCheckboxRect = RectF(x - 4.0f, bcdY - 6.0f, 460.0f, 30.0f);
-    DrawCheckbox(g, bcdBox, g_fixBcdSafeBoot,
-        L"Исправить BCD safeboot (с подтверждением)",
+    // Чекбокс 2: "BCD safeboot"
+    startX += checkboxW + checkboxGap;
+    RectF boxRect2(startX, y, 16.0f, 16.0f);
+    g_bcdCheckboxRect = RectF(startX - 4.0f, y - 4.0f, checkboxW, 24.0f);
+    DrawCheckbox(g, boxRect2, g_fixBcdSafeBoot, L"BCD safeboot",
         font, textBrush, controlBg, borderPen, checkBrush);
 
-    // Unlock / Refresh button
-    float buttonY = bcdY + 36.0f;
-    g_buttonRect = RectF(x, buttonY, 180.0f, 38.0f);
+    // Чекбокс 3: "ACL"
+    startX += checkboxW + checkboxGap;
+    RectF boxRect3(startX, y, 16.0f, 16.0f);
+    g_aclCheckboxRect = RectF(startX - 4.0f, y - 4.0f, checkboxW, 24.0f);
+    DrawCheckbox(g, boxRect3, g_fixAcl, L"ACL",
+        font, textBrush, controlBg, borderPen, checkBrush);
+
+    // Чекбокс 4: "Boot"
+    startX += checkboxW + checkboxGap;
+    RectF boxRect4(startX, y, 16.0f, 16.0f);
+    g_bootCheckboxRect = RectF(startX - 4.0f, y - 4.0f, checkboxW, 24.0f);
+    DrawCheckbox(g, boxRect4, g_fixBoot, L"Boot",
+        font, textBrush, controlBg, borderPen, checkBrush);
+
+    // ---- Кнопки справа от чекбоксов ----
+    float btnW = 80.0f;
+    float btnH = 22.0f;
+    float btnY = y + 1.0f; // небольшое смещение для выравнивания
+    float btnX = contentArea.X + contentArea.Width - 10.0f - btnW - 4.0f - btnW; // две кнопки справа
+
+    g_buttonRect = RectF(btnX, btnY, btnW, btnH);
+    g_refreshButtonRect = RectF(btnX + btnW + 4.0f, btnY, btnW, btnH);
+
     DrawButton(g, g_buttonRect,
-        g_immediateUnlock ? L"Разблокировать" : L"Обновить список",
-        font, textBrush, controlBg, borderPen);
+        g_immediateUnlock ? L"Выполнить" : L"Обновить",
+        smallFont, textBrush, controlBg, borderPen);
+    DrawButton(g, g_refreshButtonRect, L"Обновить",
+        smallFont, textBrush, controlBg, borderPen);
 
-    // Button: ACL and Boot
-    float row2Y = buttonY + 38.0f + 8.0f;
-    g_aclButtonRect = RectF(x, row2Y, 230.0f, 38.0f);
-    g_bootButtonRect = RectF(x + 238.0f, row2Y, 230.0f, 38.0f);
-    DrawButton(g, g_aclButtonRect, L"Сброс прав NTFS (ACL)",
-        font, textBrush, controlBg, borderPen);
-    DrawButton(g, g_bootButtonRect, L"Ремонт загрузки (Boot)",
-        font, textBrush, controlBg, borderPen);
-
-    // Report
-    float reportY = row2Y + 38.0f + 10.0f;
-    float reportHeight = contentArea.Height - (reportY - contentArea.Y) - 10.0f;
+    // ---- Область отчёта / лога ----
+    float reportY = y + 28.0f; // отступ после строки чекбоксов
+    float reportHeight = contentArea.Height - (reportY - contentArea.Y) - 8.0f;
     if (reportHeight > 10.0f) {
         std::vector<std::wstring> lines;
         std::wstringstream ss(g_lastReport);
@@ -138,7 +165,130 @@ void DrawUnlockContent(Graphics& g, const RectF& contentArea, Font& contentFont)
     }
 }
 
-// Clicks
+// --- Функция, выполняющая разблокировку и формирующая лог ---
+static std::wstring PerformUnlock(bool immediate, bool fixBcd, bool fixAcl, bool fixBoot) {
+    std::wstring log;
+    int unlockedCount = 0, failedCount = 0;
+
+    auto restrictions = UnlockTools::GetKnownRestrictions();
+    for (const auto& r : restrictions) {
+        if (!UnlockTools::IsRestricted(r))
+            continue;
+
+        if (immediate) {
+            if (UnlockTools::UnlockRestriction(r)) {
+                ++unlockedCount;
+                std::wstring hiveStr;
+                for (HKEY h : r.hives) {
+                    if (h == HKEY_CURRENT_USER) hiveStr = L"HKCU";
+                    else if (h == HKEY_LOCAL_MACHINE) hiveStr = L"HKLM";
+                    else hiveStr = L"UNKNOWN";
+                }
+                log += L"Разблокировано: " + r.description +
+                    L" (" + hiveStr + L"\\" + r.subKey + L"\\" + r.valueName +
+                    L" = " + std::to_wstring(r.disableValue) + L")\r\n";
+            }
+            else {
+                ++failedCount;
+                log += L"Ошибка: " + r.description + L"\r\n";
+            }
+        }
+        else {
+            log += L"Обнаружена блокировка: " + r.description + L"\r\n";
+        }
+    }
+
+    if (immediate) {
+        bool hasDisallowRun =
+            UnlockTools::HasDisallowRunAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer") ||
+            UnlockTools::HasDisallowRunAt(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+        if (hasDisallowRun) {
+            if (UnlockTools::ClearDisallowRun()) {
+                log += L"Разблокировано: DisallowRun (удалены все записи)\r\n";
+                ++unlockedCount;
+            }
+            else {
+                log += L"Ошибка: не удалось очистить DisallowRun\r\n";
+                ++failedCount;
+            }
+        }
+
+        bool hasIFEO = UnlockTools::HasIFEODebuggerAt(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options");
+        if (hasIFEO) {
+            if (UnlockTools::ClearImageFileExecutionOptions()) {
+                log += L"Разблокировано: IFEO Debugger (удалены все Debugger)\r\n";
+                ++unlockedCount;
+            }
+            else {
+                log += L"Ошибка: не удалось очистить IFEO\r\n";
+                ++failedCount;
+            }
+        }
+    }
+
+    if (fixBcd && immediate) {
+        if (UnlockTools::IsBcdSafeBootEnabled()) {
+            if (UnlockTools::ClearBcdSafeBoot()) {
+                log += L"BCD: удалено значение safeboot\r\n";
+                ++unlockedCount;
+            }
+            else {
+                log += L"BCD: не удалось удалить safeboot\r\n";
+                ++failedCount;
+            }
+        }
+        else {
+            log += L"BCD: safeboot не обнаружен\r\n";
+        }
+    }
+
+    if (fixAcl && immediate) {
+        wchar_t win[MAX_PATH] = {};
+        if (GetWindowsDirectoryW(win, MAX_PATH)) {
+            std::wstring aclLog;
+            if (UnlockTools::ResetAclOnPath(win, true, aclLog)) {
+                log += L"ACL: сброшены права на папку Windows\r\n";
+                if (!aclLog.empty()) log += aclLog + L"\r\n";
+                ++unlockedCount;
+            }
+            else {
+                log += L"ACL: ошибка при сбросе прав\r\n";
+                ++failedCount;
+            }
+        }
+        else {
+            log += L"ACL: не удалось определить папку Windows\r\n";
+        }
+    }
+
+    if (fixBoot && immediate) {
+        std::wstring bootLog;
+        if (UnlockTools::RepairBootRecords(bootLog)) {
+            log += L"Boot: выполнен ремонт записей загрузки\r\n";
+            if (!bootLog.empty()) log += bootLog + L"\r\n";
+            ++unlockedCount;
+        }
+        else {
+            log += L"Boot: ошибка при ремонте загрузки\r\n";
+            ++failedCount;
+        }
+    }
+
+    if (immediate) {
+        std::wstring header;
+        header += L"Разблокировано: " + std::to_wstring(unlockedCount) + L"\r\n";
+        header += L"Ошибок: " + std::to_wstring(failedCount) + L"\r\n\r\n";
+        log = header + log;
+    }
+    else {
+        log = L"--- Список обнаруженных блокировок ---\r\n" + log;
+    }
+
+    return log;
+}
+
+// --- Обработка кликов ---
 bool OnUnlockClick(int x, int y, const RectF& contentArea) {
     (void)contentArea;
     float fx = static_cast<float>(x);
@@ -149,73 +299,43 @@ bool OnUnlockClick(int x, int y, const RectF& contentArea) {
         InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
         return true;
     }
-
     if (HitTestRect(g_bcdCheckboxRect, fx, fy)) {
         g_fixBcdSafeBoot = !g_fixBcdSafeBoot;
         InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
         return true;
     }
-
-    // Reset NTFS permissions
-    if (HitTestRect(g_aclButtonRect, fx, fy)) {
-        if (MessageBoxW(App::Instance()->GetHWND(),
-            L"Сбросить NTFS-права на папку Windows?\r\n"
-            L"Будут выполнены: takeown /f /a /r и icacls /reset /t.\r\n"
-            L"Операция может занять несколько минут.",
-            L"Сброс ACL", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            wchar_t win[MAX_PATH] = {};
-            GetWindowsDirectoryW(win, MAX_PATH);
-            std::wstring log;
-            UnlockTools::ResetAclOnPath(win, true, log);
-            MessageBoxW(App::Instance()->GetHWND(), log.c_str(),
-                L"Сброс ACL", MB_OK | MB_ICONINFORMATION);
-        }
+    if (HitTestRect(g_aclCheckboxRect, fx, fy)) {
+        g_fixAcl = !g_fixAcl;
+        InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
+        return true;
+    }
+    if (HitTestRect(g_bootCheckboxRect, fx, fy)) {
+        g_fixBoot = !g_fixBoot;
+        InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
         return true;
     }
 
-    // Boot repair
-    if (HitTestRect(g_bootButtonRect, fx, fy)) {
-        if (MessageBoxW(App::Instance()->GetHWND(),
-            L"Выполнить ремонт записей загрузки?\r\n"
-            L"bootrec /fixmbr /fixboot /scanos\r\n"
-            L"(+ bcdboot, если отсутствует EFI-BCD).\r\n"
-            L"Рекомендуется запускать из среды восстановления.",
-            L"Ремонт загрузки", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            std::wstring log;
-            UnlockTools::RepairBootRecords(log);
-            MessageBoxW(App::Instance()->GetHWND(), log.c_str(),
-                L"Ремонт загрузки", MB_OK | MB_ICONINFORMATION);
-        }
+    if (HitTestRect(g_refreshButtonRect, fx, fy)) {
+        g_lastReport = UnlockTools::GetBestUnlockReport(false);
+        InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
         return true;
     }
 
-    // Main button
     if (HitTestRect(g_buttonRect, fx, fy)) {
-        std::wstring report = UnlockTools::GetBestUnlockReport(g_immediateUnlock);
-
-        // BCD Safeboot: separate checkbox and confirmation
-        if (g_fixBcdSafeBoot && UnlockTools::IsBcdSafeBootEnabled()) {
-            int answer = MessageBoxW(App::Instance()->GetHWND(),
-                L"Обнаружен режим BCD safeboot.\r\n"
-                L"Удалить значение safeboot из конфигурации загрузки?\r\n\r\n"
-                L"Будет выполнена команда: bcdedit /deletevalue safeboot",
-                L"Разблокировка BCD", MB_YESNO | MB_ICONWARNING);
-            if (answer == IDYES) {
-                if (UnlockTools::ClearBcdSafeBoot())
-                    report += L"\r\nBCD: safeboot удалён. Перезагрузитесь для применения.\r\n";
-                else
-                    report += L"\r\nBCD: не удалось удалить safeboot.\r\n";
-            }
-            else {
-                report += L"\r\nBCD: пользователь отменил исправление safeboot.\r\n";
-            }
-        }
-
-        g_lastReport = report;
         if (g_immediateUnlock) {
+            std::wstring log = PerformUnlock(
+                true,
+                g_fixBcdSafeBoot,
+                g_fixAcl,
+                g_fixBoot
+            );
+            g_lastReport = log;
             MessageBoxW(App::Instance()->GetHWND(),
-                L"Разблокировка выполнена.\r\nСписок обновлён.",
+                L"Разблокировка выполнена.\r\nПодробности в отчёте.",
                 L"Разблокировка", MB_OK | MB_ICONINFORMATION);
+        }
+        else {
+            g_lastReport = UnlockTools::GetBestUnlockReport(false);
         }
         InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
         return true;

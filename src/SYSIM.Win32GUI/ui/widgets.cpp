@@ -52,6 +52,11 @@ void DrawTabs(Graphics& g, const RectF& clientRect, Font& tabFont, std::vector<T
     }
 }
 
+bool HitTestRect(const RectF& rect, float x, float y) {
+    return x >= rect.X && x < rect.X + rect.Width &&
+        y >= rect.Y && y < rect.Y + rect.Height;
+}
+
 void DrawWindowButtons(Graphics& g, const RectF& clientRect, Font& font) {
     const float btnWidth = 30.0f;
     const float btnGap = 6.0f;
