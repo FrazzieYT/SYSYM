@@ -15,6 +15,7 @@
 #include <gdiplus.h>
 #include <windowsx.h>
 #include <algorithm>
+#include "utils/registry/registry_editor.h"
 
 #include <shlobj.h>
 #pragma comment(lib, "shell32.lib")
@@ -42,7 +43,7 @@ static bool IsVerticalTabs(int pos) {
     return pos == 1 || pos == 2;
 }
 
-// Полоса шапки (где табы + кнопки)
+// Полоса шапки (табы, кнопки)
 static RectF GetHeaderRect(const RectF& client, int pos) {
     switch (pos) {
     case 0: return RectF(0, 0, client.Width, HEADER_SIZE);
@@ -79,21 +80,32 @@ static RectF GetWindowButtonsArea(const RectF& client, int pos, float btnSize, f
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_TASKMGR_SIG_READY:
+        OnTaskManagerMessage(msg, wParam, lParam);
+        return 0;
+    case WM_TASKMGR_PROC_READY:
+        OnTaskManagerMessage(msg, wParam, lParam);
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        Graphics g(hdc);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        HDC hdcScreen = BeginPaint(hWnd, &ps);
 
         RECT rcClient;
         GetClientRect(hWnd, &rcClient);
-        RectF clientRect(
-            static_cast<REAL>(rcClient.left),
-            static_cast<REAL>(rcClient.top),
-            static_cast<REAL>(rcClient.right - rcClient.left),
-            static_cast<REAL>(rcClient.bottom - rcClient.top)
-        );
+        int w = rcClient.right - rcClient.left;
+        int h = rcClient.bottom - rcClient.top;
+        if (w <= 0 || h <= 0) { EndPaint(hWnd, &ps); break; }
+
+        App::Instance()->EnsureBackBuffer(w, h);
+        HDC hdcMem = App::Instance()->GetBackBufferDC();
+        if (!hdcMem) { EndPaint(hWnd, &ps); break; }
+
+        {
+            Graphics g(hdcMem);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+            RectF clientRect(0.0f, 0.0f, (REAL)w, (REAL)h);
 
         SolidBrush bgBrush(COLOR_BG);
         g.FillRectangle(&bgBrush, clientRect);
@@ -103,7 +115,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         Font contentFont(&ff, 12.0f, FontStyleRegular, UnitPixel);
         Font iconFont(&ff, 14.0f, FontStyleRegular, UnitPixel);
 
-        // ===== ШАПКА И ТАБЫ =====
+        // === Шапка и табы ===
         int tabPos = GetSettingsTabPosition();
         bool vertical = IsVerticalTabs(tabPos);
 
@@ -111,7 +123,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         SolidBrush headerBrush(COLOR_HEADER_BG);
         g.FillRectangle(&headerBrush, headerRect);
 
-        // ===== КНОПКИ УПРАВЛЕНИЯ ОКНОМ =====
+        // === Управление окном ===
         float btnSize = 36.0f;
         const float BTN_COUNT = 2.0f;
         RectF btnArea = GetWindowButtonsArea(clientRect, tabPos, btnSize, BTN_COUNT);
@@ -143,7 +155,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         DrawWindowButton(g_tabBtnMinimize, g_tabBtnMinimizeHover, L"─");
         DrawWindowButton(g_tabBtnClose, g_tabBtnCloseHover, L"✕", true);
 
-        // ===== ТАБЫ =====
+        // ===== Табы =====
         RectF tabsArea;
         if (!vertical) {
             tabsArea = RectF(headerRect.X + 8.0f, headerRect.Y,
@@ -204,7 +216,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         else {
-            // ===== ВЕРТИКАЛЬНЫЙ САЙДБАР =====
+            // === Вертикальный сайдбар ===
             const Color ITEM_HOVER(255, 52, 52, 56);
             const Color ITEM_ACTIVE(255, 0, 120, 212);
 
@@ -300,7 +312,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 -1, &sideSmall, uRightsR, &lf, &uRightsBrush);
         }
 
-        // ===== РАЗДЕЛИТЕЛЬ ШАПКИ И КОНТЕНТА =====
+        // === Разделитель шапки и контента ===
         Pen separatorPen(COLOR_BORDER, 1.0f);
         if (tabPos == 0) {
             g.DrawLine(&separatorPen, 0.0f, HEADER_SIZE, clientRect.Width, HEADER_SIZE);
@@ -315,7 +327,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g.DrawLine(&separatorPen, clientRect.Width - SIDEBAR_W, 0.0f, clientRect.Width - SIDEBAR_W, clientRect.Height);
         }
 
-        // ===== КОНТЕНТ =====
+        // ===== Контент =====
         RectF contentArea = GetContentRect(clientRect, tabPos);
 
         switch (g_activeMainTab) {
@@ -333,14 +345,21 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (g_activeMainTab != 7 && Notepad::IsActive()) {
             Notepad::Hide();
         }
+     } // Graphics g(hdcMem)
+
+        BitBlt(hdcScreen, 0, 0, w, h, hdcMem, 0, 0, SRCCOPY);
 
         EndPaint(hWnd, &ps);
         break;
     }
 
-    case WM_SIZE:
-        InvalidateRect(hWnd, nullptr, TRUE);
-        break;
+        case WM_SIZE: {
+            RECT rc;
+            GetClientRect(hWnd, &rc);
+            App::Instance()->EnsureBackBuffer(rc.right - rc.left, rc.bottom - rc.top);
+            InvalidateRect(hWnd, nullptr, FALSE);
+            break;
+        }
 
     case WM_TIMER:
         if (wParam == 1001) {
@@ -361,19 +380,19 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         int tabPos = GetSettingsTabPosition();
         RectF contentArea = GetContentRect(clientRect, tabPos);
 
-        // Слежка — отдаём событие панели монитора
+        // Слежка отдаём событие панели монитора
         if (activeTab == 5) {
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             ScreenToClient(hWnd, &pt);
             if (OnMonitorWheel(pt.x, pt.y, delta)) return 0;
         }
 
-        // Проводник — кастомный скроллбар
+        // Проводник кастомный скроллбар
         if (activeTab == 2) {
             if (ExplorerMouseWheel(delta, contentArea)) break;
         }
 
-        // Остальные вкладки — стандартный скролл
+        // Остальные вкладки стандартный скролл
         if (activeTab == 0 || activeTab == 1 ||
             activeTab == 4 || activeTab == 6) {
             int newPos = g_scrollOffset[activeTab] - delta / 30;
@@ -632,14 +651,17 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CHAR: {
-        if (IsExplorerAddressBarEditing() && g_activeMainTab == 2) {
-            if (ExplorerAddressBarProcessKey(msg, wParam, lParam)) {
+        if (IsHomeRunEditing() && g_activeMainTab == 0) {
+            if (OnHomeRunKey(msg, wParam, lParam)) return 0;
+        }
+        if (g_activeMainTab == 1) {
+            if (OnTaskManagerKey(msg, wParam, lParam)) {
                 InvalidateRect(hWnd, nullptr, TRUE);
                 return 0;
             }
         }
-        if (g_activeMainTab == 1) {
-            if (OnTaskManagerKey(msg, wParam, lParam)) {
+        if (IsExplorerAddressBarEditing() && g_activeMainTab == 2) {
+            if (ExplorerAddressBarProcessKey(msg, wParam, lParam)) {
                 InvalidateRect(hWnd, nullptr, TRUE);
                 return 0;
             }
@@ -654,14 +676,17 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_KEYDOWN: {
-        if (IsExplorerAddressBarEditing() && g_activeMainTab == 2) {
-            if (ExplorerAddressBarProcessKey(msg, wParam, lParam)) {
+        if (IsHomeRunEditing() && g_activeMainTab == 0) {
+            if (OnHomeRunKey(msg, wParam, lParam)) return 0;
+        }
+        if (g_activeMainTab == 1) {
+            if (OnTaskManagerKey(msg, wParam, lParam)) {
                 InvalidateRect(hWnd, nullptr, TRUE);
                 return 0;
             }
         }
-        if (g_activeMainTab == 1) {
-            if (OnTaskManagerKey(msg, wParam, lParam)) {
+        if (IsExplorerAddressBarEditing() && g_activeMainTab == 2) {
+            if (ExplorerAddressBarProcessKey(msg, wParam, lParam)) {
                 InvalidateRect(hWnd, nullptr, TRUE);
                 return 0;
             }
@@ -699,10 +724,16 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 1;
 
     case WM_CLOSE:
-        App::Instance()->MinimizeToTray();
+        if (RegistryEditor::IsLikelyRecoveryEnvironment()) {
+            DestroyWindow(hWnd);
+        }
+        else {
+            App::Instance()->MinimizeToTray();
+        }
         return 0;
 
     case WM_DESTROY:
+        TaskManagerShutdown();
         PostQuitMessage(0);
         break;
 

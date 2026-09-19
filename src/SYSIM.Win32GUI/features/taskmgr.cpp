@@ -3,8 +3,13 @@
 #include "core/app.h"
 #include "ui/widgets.h"
 #include "../WinCtrl/include/Process.h"
-#include "utils/process/service_manager.h"
+#include "../WinCtrl/include/Scanner.h"
+#include "../WinCtrl/include/System.h"
+#include "../WinCtrl/include/Registry.h"
+#include "utils/registry/registry_editor.h"
 #include "utils/registry/startup_registry.h"
+#include "utils/process/service_manager.h"
+#include "utils/process/offline_service_manager.h"
 #include "utils/startup/startup_edit_dialog.h"
 #include "utils/startup/service_edit_dialog.h"
 #include <string>
@@ -15,6 +20,9 @@
 #include <functional>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <winsvc.h>
+#include <atomic>
+#include <process.h>
 
 #pragma comment(lib, "../WinCtrl/lib/WinCtrl.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -25,6 +33,15 @@
 #define TASKMGR_AUTO_REFRESH_INTERVAL_MS 2000
 
 using namespace Gdiplus;
+using SigStatus = WinCtrl::Scanner::ScanResult::SigStatus;
+// Индексы подвкладок
+enum {
+    SUBTAB_PROCESSES = 0,
+    SUBTAB_STARTUP = 1,
+    SUBTAB_SERVICES = 2,
+    SUBTAB_DRIVERS = 3,
+    SUBTAB_COUNT = 4
+};
 
 // Context menu item IDs
 enum : int {
@@ -51,14 +68,26 @@ enum : int {
     IDM_SVC_AUTO,
     IDM_SVC_MANUAL,
     IDM_SVC_DISABLED,
+    IDM_SVC_EDIT = 1110,
 
     IDM_STARTUP_OPEN_LOC = 1200,
     IDM_STARTUP_DISABLE,
     IDM_STARTUP_ENABLE,
     IDM_STARTUP_REMOVE,
-
-    IDM_SVC_EDIT = 1110,
     IDM_STARTUP_EDIT = 1210,
+    IDM_DRV_EDIT = 1305,
+
+    IDM_DRV_OPEN_LOC = 1300,
+    IDM_DRV_COPY_PATH,
+    IDM_DRV_VERIFY_SIG,
+    IDM_DRV_START,
+    IDM_DRV_STOP,
+
+    IDM_DRV_BOOT = 1310,
+    IDM_DRV_SYSTEM = 1311,
+    IDM_DRV_AUTO = 1312,
+    IDM_DRV_MANUAL = 1313,
+    IDM_DRV_DISABLED = 1314,
 };
 
 struct ProcessDisplayInfo {
@@ -76,16 +105,70 @@ struct ProcessDisplayInfo {
     bool critical = false;
     bool suspended = false;
     bool wow64 = false;
+    float cpuPercent = 0.0f;
+
+    FILETIME creationTime{};
+    int riskScore = 0;
+
+    // Sig проверка подписи по клику
+    bool sigChecked = false;
+    bool sigValid = false;
+    bool sigInvalid = false;
+    bool sigMicrosoft = false;
+    std::wstring signer;
+};
+
+struct DriverDisplayInfo {
+    std::wstring serviceName;
+    std::wstring displayName;
+    std::wstring imagePath;
+    DWORD startType = 4;
+    DWORD state = 0;
+    bool isKernel = false;
+    bool isFs = false;
+
+    // Подпись (ленивая)
+    bool sigChecked = false;
+    bool sigValid = false;
+    bool sigInvalid = false;
+    bool sigMicrosoft = false;
+    std::wstring signer;
+    bool sigInProgress = false; // воркер проверяет
 };
 
 // Глобальные данные
 static std::vector<ProcessDisplayInfo> g_processes;
 static std::vector<ServiceManager::ServiceInfo> g_services;
 static std::vector<StartupRegistry::StartupEntry> g_startupEntries;
+static std::vector<DriverDisplayInfo> g_drivers;
+static bool g_servicesOffline = false;
+static bool g_driversOffline = false;
+
+// === Фоновый воркер проверки подписей драйверов ===
+static std::atomic<bool> g_sigWorkerRunning{ false };
+static std::atomic<bool> g_sigWorkerStop{ false };
+static HANDLE            g_sigWorkerThread = nullptr;
+static CRITICAL_SECTION  g_driversLock;
+static bool              g_driversLockInit = false;
+
+static void StartSigWorker(HWND hwnd); // forward decl
+static void StopSigWorker();          // forward decl
+
+// === Фоновый воркер обновления списка процессов ===
+static std::atomic<bool> g_procWorkerRunning{ false };
+static std::atomic<bool> g_procWorkerStop{ false };
+static HANDLE            g_procWorkerThread = nullptr;
+static CRITICAL_SECTION  g_procLock;
+static bool              g_procLockInit = false;
+static std::vector<ProcessDisplayInfo> g_procPending;
+
+static void StartProcWorker(HWND hwnd); // forward decl
+static void StopProcWorker();          // forward decl
 
 static int g_selectedProcessIndex = -1;
 static int g_selectedServiceIndex = -1;
 static int g_selectedStartupIndex = -1;
+static int g_selectedDriverIndex = -1;
 
 static bool g_forceRefresh = false;
 static unsigned long long g_lastRefreshTick = 0;
@@ -97,11 +180,6 @@ static bool g_searchActive = false;
 enum class SortColumn { None, Name, Pid, Memory, Threads, Cpu, User };
 static SortColumn g_sortColumn = SortColumn::Memory;
 static bool g_sortAscending = false;
-
-static std::unordered_map<DWORD, unsigned long long> g_prevCpuKernel;
-static std::unordered_map<DWORD, unsigned long long> g_prevCpuUser;
-static std::unordered_map<DWORD, unsigned long long> g_prevCpuTick;
-static std::unordered_map<DWORD, float> g_cpuUsagePercent;
 
 static RectF g_btnEndProcess;
 static RectF g_btnRefresh;
@@ -118,9 +196,10 @@ static const float COL_MIN_WIDTH = 40.0f;
 static const float COL_MAX_WIDTH = 600.0f;
 static const float RESIZE_HIT_ZONE = 5.0f;
 
-static float g_procColWidths[5] = { 60.0f, 200.0f, 70.0f, 90.0f, 60.0f };
+static float g_procColWidths[6] = { 60.0f, 200.0f, 70.0f, 90.0f, 60.0f, 40.0f };
 static float g_svcColWidths[3] = { 200.0f, 120.0f, 120.0f };
 static float g_startupColWidths[4] = { 150.0f, 250.0f, 120.0f, 100.0f };
+static float g_driverColWidths[6] = { 150.0f, 180.0f, 80.0f, 90.0f, 250.0f, 40.0f };
 
 static bool g_colWidthsInitialized = false;
 static int g_resizingColIndex = -1;
@@ -163,36 +242,7 @@ static TaskmgrLayout GetLayout(const RectF& contentArea, bool subTabsExpanded) {
 }
 
 static bool IsLikelyRecoveryEnvironment() {
-    static int cached = -1;
-    if (cached != -1) return cached == 1;
-    bool result = false;
-
-    wchar_t systemDrive[16] = {};
-    DWORD driveLen = GetEnvironmentVariableW(L"SystemDrive", systemDrive, 16);
-    if (driveLen > 0 && lstrcmpiW(systemDrive, L"X:") == 0) result = true;
-
-    if (!result) {
-        wchar_t windowsDir[MAX_PATH] = {};
-        if (GetWindowsDirectoryW(windowsDir, MAX_PATH) != 0) {
-            if (CompareStringOrdinal(windowsDir, 2, L"X:", 2, TRUE) == CSTR_EQUAL) result = true;
-        }
-    }
-    if (!result) {
-        wchar_t systemDir[MAX_PATH] = {};
-        if (GetSystemDirectoryW(systemDir, MAX_PATH) != 0) {
-            if (CompareStringOrdinal(systemDir, 2, L"X:", 2, TRUE) == CSTR_EQUAL) result = true;
-        }
-    }
-    if (!result) {
-        HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\MiniNT",
-            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            result = true;
-            RegCloseKey(hKey);
-        }
-    }
-    cached = result ? 1 : 0;
-    return result;
+    return RegistryEditor::IsLikelyRecoveryEnvironment();
 }
 
 static std::wstring FormatMemory(unsigned long long bytes) {
@@ -234,109 +284,802 @@ static std::wstring ServiceStartTypeToString(ServiceManager::ServiceStartType st
     }
 }
 
+static std::wstring DriverStartTypeToString(DWORD st) {
+    switch (st) {
+    case SERVICE_BOOT_START:   return L"Boot";
+    case SERVICE_SYSTEM_START: return L"System";
+    case SERVICE_AUTO_START:   return L"Авто";
+    case SERVICE_DEMAND_START: return L"Вручную";
+    case SERVICE_DISABLED:     return L"Отключена";
+    default:                   return L"Неизвестно";
+    }
+}
+
+static std::wstring DriverStateToString(DWORD state) {
+    switch (state) {
+    case SERVICE_RUNNING:       return L"Работает";
+    case SERVICE_STOPPED:       return L"Остановлен";
+    case SERVICE_START_PENDING: return L"Запускается...";
+    case SERVICE_STOP_PENDING:  return L"Останавливается...";
+    default:                    return L"—";
+    }
+}
+
+// \SystemRoot\System32\drivers\foo.sys -> C:\Windows\System32\drivers\foo.sys
+static std::wstring ResolveDriverPath(const std::wstring& imagePath) {
+    if (imagePath.empty()) return L"";
+
+    std::wstring p = imagePath;
+
+    // \SystemRoot\...
+    const std::wstring sysRoot = L"\\SystemRoot\\";
+    if (p.size() >= sysRoot.size() &&
+        _wcsnicmp(p.c_str(), sysRoot.c_str(), sysRoot.size()) == 0) {
+        wchar_t winDir[MAX_PATH] = {};
+        (void)GetWindowsDirectoryW(winDir, MAX_PATH);
+        p = std::wstring(winDir) + p.substr(sysRoot.size() - 1);
+    }
+    // \??\C:\...
+    else if (p.size() >= 4 && p[0] == L'\\' && p[1] == L'?' && p[2] == L'?' && p[3] == L'\\') {
+        p = p.substr(4);
+    }
+
+    // Убираем кавычки
+    if (!p.empty() && p[0] == L'"') {
+        size_t e = p.find(L'"', 1);
+        if (e != std::wstring::npos) p = p.substr(1, e - 1);
+    }
+
+    // Отрезаем аргументы, оставляем до .sys включительно
+    size_t sysEnd = p.find(L".sys");
+    if (sysEnd != std::wstring::npos) p = p.substr(0, sysEnd + 4);
+
+    return p;
+}
+
 static unsigned long long FileTimeToULL(const FILETIME& ft) {
     return ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
-static void UpdateCpuUsage() {
-    unsigned long long currentTick = GetTickCount64();
-    std::unordered_map<DWORD, unsigned long long> newKernel, newUser, newTick;
-    std::unordered_map<DWORD, float> newCpu;
+static void LoadProcessDetails(int idx) {
+    if (idx < 0 || idx >= (int)g_processes.size()) return;
+    auto& info = g_processes[idx];
 
-    for (const auto& proc : g_processes) {
-        unsigned long long kernel = FileTimeToULL(proc.kernelTime);
-        unsigned long long user = FileTimeToULL(proc.userTime);
-        unsigned long long total = kernel + user;
+    auto procInfo = WinCtrl::Process::GetProcessInfo(info.pid);
 
-        auto itK = g_prevCpuKernel.find(proc.pid);
-        auto itT = g_prevCpuTick.find(proc.pid);
+    info.userName = procInfo.userName;
+    info.critical = procInfo.isCritical;
+    info.suspended = procInfo.isSuspended;
+    info.handleCount = procInfo.handleCount;
+    info.priority = procInfo.priorityClass;
 
-        if (itK != g_prevCpuKernel.end() && itT != g_prevCpuTick.end()) {
-            unsigned long long deltaTime = currentTick - itT->second;
-            if (deltaTime > 0) {
-                unsigned long long prevTotal = itK->second + g_prevCpuUser[proc.pid];
-                unsigned long long deltaCpu = (total > prevTotal) ? (total - prevTotal) : 0;
-                SYSTEM_INFO si;
-                GetSystemInfo(&si);
-                float cpuPercent = (float)((double)deltaCpu / 10000.0 / (double)deltaTime * 100.0);
-                if (cpuPercent > 100.0f * si.dwNumberOfProcessors)
-                    cpuPercent = 100.0f * si.dwNumberOfProcessors;
-                newCpu[proc.pid] = cpuPercent;
-            }
-        }
-
-        newKernel[proc.pid] = kernel;
-        newUser[proc.pid] = user;
-        newTick[proc.pid] = currentTick;
+    if (!info.sigChecked && !info.fullPath.empty()) {
+        std::wstring signer;
+        bool isMs = false, isTrusted = false;
+        auto st = WinCtrl::Scanner::VerifySignature(
+            info.fullPath, &signer, nullptr, &isMs, &isTrusted, true);
+        info.signer = signer;
+        info.sigMicrosoft = isMs;
+        info.sigValid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Valid);
+        info.sigInvalid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Invalid);
+        info.sigChecked = true;
     }
-
-    g_prevCpuKernel = std::move(newKernel);
-    g_prevCpuUser = std::move(newUser);
-    g_prevCpuTick = std::move(newTick);
-    g_cpuUsagePercent = std::move(newCpu);
 }
 
-static int GetThreadCount(DWORD pid) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
-    if (Process32FirstW(hSnapshot, &pe)) {
-        do {
-            if (pe.th32ProcessID == pid) {
-                CloseHandle(hSnapshot);
-                return pe.cntThreads;
-            }
-        } while (Process32NextW(hSnapshot, &pe));
+static void LoadDriverSignature(int idx) {
+    if (idx < 0 || idx >= (int)g_drivers.size()) return;
+    auto& d = g_drivers[idx];
+    if (d.sigChecked || d.sigInProgress) return;
+    if (d.imagePath.empty()) {
+        d.sigChecked = true;
+        return;
     }
-    CloseHandle(hSnapshot);
-    return 0;
+    std::wstring signer;
+    bool isMs = false, isTrusted = false;
+    auto st = WinCtrl::Scanner::VerifySignature(
+        d.imagePath, &signer, nullptr, &isMs, &isTrusted, true);
+    d.signer = signer;
+    d.sigMicrosoft = isMs;
+    d.sigValid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Valid);
+    d.sigInvalid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Invalid);
+    d.sigChecked = true;
 }
 
 static void RefreshProcessList() {
-    auto pidList = WinCtrl::Process::GetList();
-    g_processes.clear();
-    g_processes.reserve(pidList.size());
+    if (!g_procWorkerRunning.load())
+        StartProcWorker(App::Instance()->GetHWND());
+}
 
-    for (const auto& pe : pidList) {
-        DWORD pid = pe.th32ProcessID;
-        ProcessDisplayInfo info{};
-        info.pid = pid;
-        info.parentPid = pe.th32ParentProcessID;
-        info.name = pe.szExeFile;
+// === WinRE offline startup ===
+static void RefreshStartupList();   // forward decl (нужен для fallback в *Offline)
 
-        auto procInfo = WinCtrl::Process::GetProcessInfo(pid);
-        info.fullPath = procInfo.imagePath;
-        info.userName = procInfo.userName;
-        info.memoryUsage = procInfo.workingSetSize;
-        info.priority = procInfo.priorityClass;
-        info.critical = procInfo.isCritical;
-        info.suspended = procInfo.isSuspended;
-        info.wow64 = procInfo.isWow64;
-        info.handleCount = procInfo.handleCount;
-        info.kernelTime = procInfo.kernelTime;
-        info.userTime = procInfo.userTime;
-        info.threadCount = GetThreadCount(pid);
+struct OfflineMounts {
+    std::wstring softwareMount;                // "OfflineSoftware" под HKLM
+    std::wstring systemMount;                  // "OfflineSystem" под HKLM
+    std::vector<std::wstring> userMounts;      // "OfflineUser_<name>" под HKU
+    std::vector<std::wstring> ownedMounts;     // выгрузить на выходе
+    bool attemptDone = false;
+};
 
-        g_processes.push_back(info);
+static OfflineMounts g_offlineMounts;
+
+// Идемпотентно: если уже смонтировано, ничего не делает
+static void EnsureOfflineStartupMounts() {
+    if (g_offlineMounts.attemptDone) return;
+    g_offlineMounts.attemptDone = true;
+
+    std::wstring winPath = WinCtrl::System::GetOfflineWindowsPath();
+    if (winPath.empty()) return;
+
+    // --- SOFTWARE ---
+    const wchar_t* softMount = L"OfflineSoftware";
+    std::wstring softFile = winPath + L"\\System32\\config\\SOFTWARE";
+    if (RegistryEditor::LoadHive(HKEY_LOCAL_MACHINE, softMount, softFile)) {
+        g_offlineMounts.softwareMount = softMount;
+        g_offlineMounts.ownedMounts.push_back(softMount);
     }
 
-    UpdateCpuUsage();
+    // --- SYSTEM ---
+    const wchar_t* sysMount = L"OfflineSystem";
+    std::wstring sysFile = winPath + L"\\System32\\config\\SYSTEM";
+    if (RegistryEditor::LoadHive(HKEY_LOCAL_MACHINE, sysMount, sysFile)) {
+        g_offlineMounts.systemMount = sysMount;
+        g_offlineMounts.ownedMounts.push_back(sysMount);
+    }
+
+    // --- NTUSER.DAT каждого профиля ---
+    std::wstring drive = winPath.substr(0, 2);
+    std::wstring usersDir = drive + L"\\Users";
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((usersDir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == L'.') continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (_wcsicmp(fd.cFileName, L"All Users") == 0) continue;
+        if (_wcsicmp(fd.cFileName, L"Default User") == 0) continue;
+
+        std::wstring ntPath = usersDir + L"\\" + fd.cFileName + L"\\NTUSER.DAT";
+        DWORD attr = GetFileAttributesW(ntPath.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) continue;
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        std::wstring mountName = L"OfflineUser_" + std::wstring(fd.cFileName);
+        if (RegistryEditor::LoadHive(HKEY_USERS, mountName.c_str(), ntPath)) {
+            g_offlineMounts.userMounts.push_back(mountName);
+            g_offlineMounts.ownedMounts.push_back(mountName);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
 }
 
 static void RefreshServicesList() {
+    g_servicesOffline = false;
+
+    if (IsLikelyRecoveryEnvironment()) {
+        EnsureOfflineStartupMounts();
+        if (!g_offlineMounts.systemMount.empty()) {
+            std::wstring winPath = WinCtrl::System::GetOfflineWindowsPath();
+            auto infos = OfflineServiceManager::Enumerate(
+                g_offlineMounts.systemMount, winPath, /*driversOnly=*/false);
+
+            g_services.clear();
+            g_services.reserve(infos.size());
+            for (const auto& o : infos) {
+                ServiceManager::ServiceInfo s;
+                s.name = o.name;
+                s.displayName = o.displayName;
+                s.description = o.description;
+                s.state = ServiceManager::ServiceState::Unknown;
+                s.startType = (o.start <= 4)
+                    ? static_cast<ServiceManager::ServiceStartType>(o.start)
+                    : ServiceManager::ServiceStartType::Unknown;
+                s.pid = 0;
+                g_services.push_back(std::move(s));
+            }
+            g_servicesOffline = true;
+            return;
+        }
+    }
+
     g_services = ServiceManager::GetServices();
 }
 
+// Список локаций для диалога "Создать" в офлайн-режиме
+static std::vector<StartupEditDialog::Location> BuildOfflineStartupLocations() {
+    std::vector<StartupEditDialog::Location> locs;
+
+    // HKLM\...\Run и RunOnce (SOFTWARE целевой системы)
+    if (!g_offlineMounts.softwareMount.empty()) {
+        const std::wstring& m = g_offlineMounts.softwareMount;
+        locs.push_back({ HKEY_LOCAL_MACHINE,
+            m + L"\\Microsoft\\Windows\\CurrentVersion\\Run",
+            L"HKLM \\ Run (офлайн)", KEY_WOW64_64KEY });
+        locs.push_back({ HKEY_LOCAL_MACHINE,
+            m + L"\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+            L"HKLM \\ RunOnce (офлайн)", KEY_WOW64_64KEY });
+    }
+
+    // HKCU\...\Run каждого офлайн-профиля
+    for (const auto& userMount : g_offlineMounts.userMounts) {
+        // Извлекаем имя профиля из "OfflineUser_Jack" -> "Jack"
+        std::wstring profileName = userMount;
+        const std::wstring prefix = L"OfflineUser_";
+        if (profileName.rfind(prefix, 0) == 0)
+            profileName = profileName.substr(prefix.size());
+
+        locs.push_back({ HKEY_USERS,
+            userMount + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            L"HKCU (" + profileName + L") \\ Run (офлайн)", KEY_WOW64_64KEY });
+        locs.push_back({ HKEY_USERS,
+            userMount + L"\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+            L"HKCU (" + profileName + L") \\ RunOnce (офлайн)", KEY_WOW64_64KEY });
+    }
+
+    return locs;
+}
+
+static void RefreshStartupListOffline() {
+    g_startupEntries.clear();
+    EnsureOfflineStartupMounts();
+
+    if (g_offlineMounts.softwareMount.empty() &&
+        g_offlineMounts.userMounts.empty())
+    {
+        // Не смогли достать ни один улей, читаем как есть
+        g_startupEntries = StartupRegistry::GetAllEntries();
+        return;
+    }
+
+    g_startupEntries = StartupRegistry::GetOfflineEntries(
+        g_offlineMounts.softwareMount,
+        g_offlineMounts.userMounts);
+}
+
 static void RefreshStartupList() {
+    if (IsLikelyRecoveryEnvironment()) {
+        RefreshStartupListOffline();
+        return;
+    }
     g_startupEntries = StartupRegistry::GetAllEntries();
+}
+
+void TaskManagerShutdown() {
+    StopSigWorker();
+    StopProcWorker();
+    for (const auto& m : g_offlineMounts.ownedMounts) {
+        if (m.rfind(L"OfflineUser_", 0) == 0)
+            RegistryEditor::UnloadHive(HKEY_USERS, m.c_str());
+        else
+            RegistryEditor::UnloadHive(HKEY_LOCAL_MACHINE, m.c_str());
+    }
+    g_offlineMounts.ownedMounts.clear();
+    g_offlineMounts.userMounts.clear();
+    g_offlineMounts.softwareMount.clear();
+    g_offlineMounts.systemMount.clear();
+    g_offlineMounts.attemptDone = false;
+
+    if (g_driversLockInit) {
+        DeleteCriticalSection(&g_driversLock);
+        g_driversLockInit = false;
+    }
+    if (g_procLockInit) {
+        DeleteCriticalSection(&g_procLock);
+        g_procLockInit = false;
+    }
+}
+
+// === Фоновый воркер проверки подписей ===
+static unsigned __stdcall SigWorkerProc(void* p);
+
+static void StartSigWorker(HWND hwnd) {
+    if (g_sigWorkerRunning.load()) return;
+    if (!g_driversLockInit) {
+        InitializeCriticalSection(&g_driversLock);
+        g_driversLockInit = true;
+    }
+
+    g_sigWorkerStop.store(false);
+    unsigned tid = 0;
+    g_sigWorkerThread = (HANDLE)_beginthreadex(
+        nullptr, 0, SigWorkerProc, (void*)hwnd, 0, &tid);
+    if (g_sigWorkerThread) {
+        g_sigWorkerRunning.store(true);
+    }
+}
+
+static void StopSigWorker() {
+    if (!g_sigWorkerRunning.load() && !g_sigWorkerThread) return;
+    g_sigWorkerStop.store(true);
+    if (g_sigWorkerThread) {
+        WaitForSingleObject(g_sigWorkerThread, 5000);
+        CloseHandle(g_sigWorkerThread);
+        g_sigWorkerThread = nullptr;
+    }
+    g_sigWorkerRunning.store(false);
+}
+
+// === Быстрые эвристики процесса ===
+// Vетаданные (путь, имя, время)
+static int ComputeProcessRisk(const ProcessDisplayInfo& p,
+    const std::vector<ProcessDisplayInfo>& all)
+{
+    if (p.fullPath.empty()) return 0;
+    int score = 0;
+
+    std::wstring lower = p.fullPath;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+    // 1. Запущен из TEMP / AppData / Windows\Temp
+    {
+        wchar_t temp[MAX_PATH] = {};
+        wchar_t appdata[MAX_PATH] = {};
+        GetEnvironmentVariableW(L"TEMP", temp, MAX_PATH);
+        GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+
+        auto startsWith = [&](const wchar_t* s) {
+            if (!s || !*s) return false;
+            std::wstring sub = s;
+            std::transform(sub.begin(), sub.end(), sub.begin(), ::towlower);
+            return lower.compare(0, sub.size(), sub) == 0;
+            };
+
+        if (startsWith(temp) || startsWith(appdata))
+            score += 3;
+        else if (lower.find(L"\\windows\\temp\\") != std::wstring::npos)
+            score += 3;
+    }
+
+    // 2. Системный бинарь не из System32 / SysWOW64
+    {
+        std::wstring n = p.name;
+        std::transform(n.begin(), n.end(), n.begin(), ::towlower);
+
+        static const wchar_t* kSys[] = {
+            L"svchost.exe", L"lsass.exe", L"services.exe", L"csrss.exe",
+            L"winlogon.exe", L"smss.exe", L"wininit.exe", L"spoolsv.exe",
+            L"taskhost.exe", L"taskhostw.exe", L"dwm.exe", L"conhost.exe",
+            L"runtimebroker.exe", L"searchindexer.exe", L"sihost.exe",
+            L"fontdrvhost.exe", L"ctfmon.exe", L"explorer.exe", L"wmiprvse.exe"
+        };
+        for (auto* s : kSys) {
+            if (n == s) {
+                if (lower.find(L"\\system32\\") == std::wstring::npos &&
+                    lower.find(L"\\syswow64\\") == std::wstring::npos)
+                    score += 5;
+                break;
+            }
+        }
+    }
+
+    // 3. Свежий файл (создан < 7 дней назад)
+    if (p.creationTime.dwHighDateTime || p.creationTime.dwLowDateTime) {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        ULARGE_INTEGER a, b;
+        a.LowPart = p.creationTime.dwLowDateTime;
+        a.HighPart = p.creationTime.dwHighDateTime;
+        b.LowPart = now.dwLowDateTime;
+        b.HighPart = now.dwHighDateTime;
+        ULONGLONG ageSec = (b.QuadPart - a.QuadPart) / 10000000ULL;
+        if (ageSec < 7ULL * 24 * 3600) score += 2;
+    }
+
+    // 4. Дубликат имени из другого пути
+    {
+        int same = 0, diffPath = 0;
+        for (const auto& q : all) {
+            if (_wcsicmp(q.name.c_str(), p.name.c_str()) == 0) {
+                ++same;
+                if (_wcsicmp(q.fullPath.c_str(), p.fullPath.c_str()) != 0)
+                    ++diffPath;
+            }
+        }
+        if (same >= 2 && diffPath >= 1) score += 2;
+    }
+
+    return score;
+}
+
+// === Фоновый воркер обновления списка процессов ===
+static unsigned __stdcall ProcWorkerProc(void* p) {
+    HWND hwnd = (HWND)p;
+
+    std::unordered_map<DWORD, unsigned long long> prevKernel, prevUser;
+    unsigned long long prevTick = GetTickCount64();
+
+    while (!g_procWorkerStop.load()) {
+        // 1. Снимок процессов
+        auto pidList = WinCtrl::Process::GetList();
+
+        std::unordered_map<DWORD, int> threadCounts;
+        HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hThreadSnap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te{ sizeof(te) };
+            if (Thread32First(hThreadSnap, &te)) {
+                do { threadCounts[te.th32OwnerProcessID]++; } while (Thread32Next(hThreadSnap, &te));
+            }
+            CloseHandle(hThreadSnap);
+        }
+
+        unsigned long long now = GetTickCount64();
+        unsigned long long deltaTime = now - prevTick;
+        if (deltaTime == 0) deltaTime = 1;
+
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        float maxCpu = 100.0f * si.dwNumberOfProcessors;
+
+        std::vector<ProcessDisplayInfo> fresh;
+        fresh.reserve(pidList.size());
+
+        std::unordered_map<DWORD, unsigned long long> newKernel, newUser;
+
+        for (const auto& pe : pidList) {
+            if (g_procWorkerStop.load()) break;
+
+            DWORD pid = pe.th32ProcessID;
+            ProcessDisplayInfo info{};
+            info.pid = pid;
+            info.parentPid = pe.th32ParentProcessID;
+            info.name = pe.szExeFile;
+            info.threadCount = threadCounts.count(pid) ? threadCounts[pid] : 0;
+
+            HANDLE hProc = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+            if (hProc) {
+                wchar_t path[MAX_PATH] = {};
+                DWORD sz = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProc, 0, path, &sz))
+                    info.fullPath = path;
+
+                PROCESS_MEMORY_COUNTERS_EX pmc{ sizeof(pmc) };
+                if (GetProcessMemoryInfo(hProc,
+                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                    info.memoryUsage = pmc.WorkingSetSize;
+
+                BOOL wow64 = FALSE;
+                if (IsWow64Process(hProc, &wow64)) info.wow64 = wow64 != FALSE;
+
+                FILETIME ct, et, kt, ut;
+                if (GetProcessTimes(hProc, &ct, &et, &kt, &ut)) {
+                    info.kernelTime = kt;
+                    info.userTime = ut;
+                    info.creationTime = ct;
+                }
+                CloseHandle(hProc);
+            }
+
+            unsigned long long kernel = FileTimeToULL(info.kernelTime);
+            unsigned long long user = FileTimeToULL(info.userTime);
+            auto itK = prevKernel.find(pid);
+            auto itU = prevUser.find(pid);
+            if (itK != prevKernel.end() && itU != prevUser.end()) {
+                unsigned long long prevTotal = itK->second + itU->second;
+                unsigned long long total = kernel + user;
+                unsigned long long deltaCpu = (total > prevTotal) ? (total - prevTotal) : 0;
+                float pct = (float)((double)deltaCpu / 10000.0 / (double)deltaTime * 100.0);
+                if (pct > maxCpu) pct = maxCpu;
+                info.cpuPercent = pct;
+            }
+            newKernel[pid] = kernel;
+            newUser[pid] = user;
+
+            fresh.push_back(std::move(info));
+        }
+
+        // Эвристики считаем один раз на снимок
+        for (auto& pr : fresh)
+            pr.riskScore = ComputeProcessRisk(pr, fresh);
+
+        prevKernel = std::move(newKernel);
+        prevUser = std::move(newUser);
+        prevTick = now;
+
+        if (g_procWorkerStop.load()) break;
+
+        // 2. Перенос пользовательских данных из старого списка (по PID)
+        EnterCriticalSection(&g_procLock);
+        {
+            std::unordered_map<DWORD, int> oldIdx;
+            oldIdx.reserve(g_processes.size());
+            for (int i = 0; i < (int)g_processes.size(); ++i)
+                oldIdx[g_processes[i].pid] = i;
+
+            for (auto& f : fresh) {
+                auto it = oldIdx.find(f.pid);
+                if (it == oldIdx.end()) continue;
+                const auto& o = g_processes[it->second];
+                f.sigChecked = o.sigChecked;
+                f.sigValid = o.sigValid;
+                f.sigInvalid = o.sigInvalid;
+                f.sigMicrosoft = o.sigMicrosoft;
+                f.signer = o.signer;
+                f.userName = o.userName;
+                f.critical = o.critical;
+                f.suspended = o.suspended;
+                f.handleCount = o.handleCount;
+                f.priority = o.priority;
+            }
+
+            g_procPending = std::move(fresh);
+        }
+        LeaveCriticalSection(&g_procLock);
+
+        // 3. Уведомить UI
+        if (hwnd && IsWindow(hwnd))
+            PostMessageW(hwnd, WM_TASKMGR_PROC_READY, 0, 0);
+
+        // 4. Пауза ~2 сек с проверкой отмены
+        for (int i = 0; i < 20 && !g_procWorkerStop.load(); ++i)
+            Sleep(100);
+    }
+    return 0;
+}
+
+static void StartProcWorker(HWND hwnd) {
+    if (g_procWorkerRunning.load()) return;
+    if (!g_procLockInit) {
+        InitializeCriticalSection(&g_procLock);
+        g_procLockInit = true;
+    }
+    g_procWorkerStop.store(false);
+    unsigned tid = 0;
+    g_procWorkerThread = (HANDLE)_beginthreadex(
+        nullptr, 0, ProcWorkerProc, (void*)hwnd, 0, &tid);
+    if (g_procWorkerThread)
+        g_procWorkerRunning.store(true);
+}
+
+static void StopProcWorker() {
+    if (!g_procWorkerRunning.load() && !g_procWorkerThread) return;
+    g_procWorkerStop.store(true);
+    if (g_procWorkerThread) {
+        WaitForSingleObject(g_procWorkerThread, 5000);
+        CloseHandle(g_procWorkerThread);
+        g_procWorkerThread = nullptr;
+    }
+    g_procWorkerRunning.store(false);
+}
+
+static unsigned __stdcall SigWorkerProc(void* p) {
+    HWND hwnd = (HWND)p;
+
+    while (!g_sigWorkerStop.load()) {
+        // 1. Найти следующий непроверенный драйвер
+        int idx = -1;
+        std::wstring path;
+
+        EnterCriticalSection(&g_driversLock);
+        for (int i = 0; i < (int)g_drivers.size(); ++i) {
+            if (!g_drivers[i].sigChecked && !g_drivers[i].sigInProgress) {
+                g_drivers[i].sigInProgress = true;
+                idx = i;
+                path = g_drivers[i].imagePath;
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_driversLock);
+
+        if (idx < 0) {
+            // Задач нет, ждём появления (refresh может добавить)
+            for (int i = 0; i < 20 && !g_sigWorkerStop.load(); ++i) {
+                Sleep(25);
+            }
+            continue;
+        }
+
+        // 2. Пустой путь, нечего проверять
+        if (path.empty()) {
+            EnterCriticalSection(&g_driversLock);
+            if (idx < (int)g_drivers.size()) {
+                g_drivers[idx].sigChecked = true;
+                g_drivers[idx].sigInProgress = false;
+            }
+            LeaveCriticalSection(&g_driversLock);
+            continue;
+        }
+
+        // 3. Проверка подписи (медленная часть, вне лока)
+        std::wstring signer;
+        bool isMs = false, isTrusted = false;
+        auto st = WinCtrl::Scanner::VerifySignature(
+            path, &signer, nullptr, &isMs, &isTrusted, true);
+
+        if (g_sigWorkerStop.load()) break;
+
+        // 4. Записать результат под локом
+        EnterCriticalSection(&g_driversLock);
+        if (idx < (int)g_drivers.size()) {
+            g_drivers[idx].signer = signer;
+            g_drivers[idx].sigMicrosoft = isMs;
+            g_drivers[idx].sigValid =
+                (st == WinCtrl::Scanner::ScanResult::SigStatus::Valid);
+            g_drivers[idx].sigInvalid =
+                (st == WinCtrl::Scanner::ScanResult::SigStatus::Invalid);
+            g_drivers[idx].sigChecked = true;
+            g_drivers[idx].sigInProgress = false;
+        }
+        LeaveCriticalSection(&g_driversLock);
+
+        // 5. Уведомить UI
+        if (hwnd && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WM_TASKMGR_SIG_READY, 0, 0);
+        }
+        // 6. Отдых
+        Sleep(10);
+    }
+
+    return 0;
+}
+
+bool OnTaskManagerMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    (void)wParam; (void)lParam;
+
+    if (msg == WM_TASKMGR_SIG_READY) {
+        if (g_activeMainTab == 1 && g_activeSubTab == SUBTAB_DRIVERS)
+            InvalidateRect(App::Instance()->GetHWND(), nullptr, FALSE);
+        return true;
+    }
+
+    if (msg == WM_TASKMGR_PROC_READY) {
+        if (g_procLockInit) {
+            EnterCriticalSection(&g_procLock);
+            std::swap(g_processes, g_procPending);
+            g_procPending.clear();
+            LeaveCriticalSection(&g_procLock);
+        }
+        if (g_activeMainTab == 1 && g_activeSubTab == SUBTAB_PROCESSES)
+            InvalidateRect(App::Instance()->GetHWND(), nullptr, FALSE);
+        return true;
+    }
+
+    return false;
+}
+
+static void RefreshDriversList() {
+    if (!g_driversLockInit) {
+        InitializeCriticalSection(&g_driversLock);
+        g_driversLockInit = true;
+    }
+
+    StopSigWorker();
+
+    std::vector<DriverDisplayInfo> fresh;
+    bool offline = false;
+
+    if (IsLikelyRecoveryEnvironment()) {
+        EnsureOfflineStartupMounts();
+        if (!g_offlineMounts.systemMount.empty()) {
+            std::wstring winPath = WinCtrl::System::GetOfflineWindowsPath();
+            auto infos = OfflineServiceManager::Enumerate(
+                g_offlineMounts.systemMount, winPath, /*driversOnly=*/true);
+
+            fresh.reserve(infos.size());
+            for (const auto& o : infos) {
+                DriverDisplayInfo d;
+                d.serviceName = o.name;
+                d.displayName = o.displayName;
+                d.imagePath = o.imagePath;
+                d.startType = o.start;
+                d.state = 0;
+                d.isKernel = (o.type & SERVICE_KERNEL_DRIVER) != 0;
+                d.isFs = (o.type & SERVICE_FILE_SYSTEM_DRIVER) != 0;
+                fresh.push_back(std::move(d));
+            }
+            offline = true;
+        }
+    }
+
+    if (!offline) {
+        HKEY hServices = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Services",
+            0, KEY_ENUMERATE_SUB_KEYS | KEY_READ, &hServices) == ERROR_SUCCESS)
+        {
+            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+
+            wchar_t subName[512];
+            DWORD index = 0;
+            while (true) {
+                DWORD len = 512;
+                if (RegEnumKeyExW(hServices, index++, subName, &len,
+                    nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+
+                HKEY hSvc = nullptr;
+                if (RegOpenKeyExW(hServices, subName, 0, KEY_READ, &hSvc) != ERROR_SUCCESS)
+                    continue;
+
+                DWORD type = 0, typeSize = sizeof(type);
+                RegQueryValueExW(hSvc, L"Type", nullptr, nullptr, (LPBYTE)&type, &typeSize);
+
+                DWORD baseType = type & 0x3;
+                bool isKernel = (baseType == 1 || baseType == 3);
+                bool isFs = (baseType == 2 || baseType == 3);
+
+                if (!isKernel && !isFs) {
+                    RegCloseKey(hSvc);
+                    continue;
+                }
+
+                DriverDisplayInfo info;
+                info.serviceName = subName;
+                info.isKernel = isKernel;
+                info.isFs = isFs;
+
+                wchar_t buf[4096] = {};
+                DWORD bufSize = sizeof(buf);
+                if (RegQueryValueExW(hSvc, L"ImagePath", nullptr, nullptr,
+                    (LPBYTE)buf, &bufSize) == ERROR_SUCCESS) {
+                    info.imagePath = ResolveDriverPath(buf);
+                }
+
+                bufSize = sizeof(buf);
+                if (RegQueryValueExW(hSvc, L"DisplayName", nullptr, nullptr,
+                    (LPBYTE)buf, &bufSize) == ERROR_SUCCESS) {
+                    info.displayName = buf;
+                }
+                else {
+                    info.displayName = subName;
+                }
+
+                DWORD startType = 4, stSize = sizeof(startType);
+                RegQueryValueExW(hSvc, L"Start", nullptr, nullptr,
+                    (LPBYTE)&startType, &stSize);
+                info.startType = startType;
+
+                if (scm) {
+                    SC_HANDLE hService = OpenServiceW(scm, subName, SERVICE_QUERY_STATUS);
+                    if (hService) {
+                        SERVICE_STATUS status{};
+                        if (QueryServiceStatus(hService, &status))
+                            info.state = status.dwCurrentState;
+                        CloseServiceHandle(hService);
+                    }
+                }
+
+                RegCloseKey(hSvc);
+                fresh.push_back(std::move(info));
+            }
+
+            if (scm) CloseServiceHandle(scm);
+            RegCloseKey(hServices);
+        }
+
+        std::sort(fresh.begin(), fresh.end(),
+            [](const DriverDisplayInfo& a, const DriverDisplayInfo& b) {
+                return _wcsicmp(a.serviceName.c_str(), b.serviceName.c_str()) < 0;
+            });
+    }
+
+    // Атомарно подменяем вектор
+    EnterCriticalSection(&g_driversLock);
+    g_drivers = std::move(fresh);
+    LeaveCriticalSection(&g_driversLock);
+
+    g_driversOffline = offline;
+
+    // Запускаем воркер, он пройдёт по всем sigChecked == false
+    StartSigWorker(App::Instance()->GetHWND());
 }
 
 static void DoRefresh() {
     int tab = g_activeSubTab;
     switch (tab) {
-    case 0: RefreshProcessList(); break;
-    case 1: RefreshServicesList(); break;
-    case 2: RefreshStartupList(); break;
+    case SUBTAB_PROCESSES:
+        if (!IsLikelyRecoveryEnvironment()) RefreshProcessList();
+        break;
+    case SUBTAB_STARTUP:
+        RefreshStartupList();
+        break;
+    case SUBTAB_SERVICES:
+        RefreshServicesList();
+        break;
+    case SUBTAB_DRIVERS:
+        RefreshDriversList();
+        break;
     }
     g_lastRefreshTick = GetTickCount64();
     g_forceRefresh = false;
@@ -433,12 +1176,10 @@ static std::vector<int> GetFilteredProcessIndices() {
         case SortColumn::Pid:     cmp = (pa.pid < pb.pid) ? -1 : (pa.pid > pb.pid ? 1 : 0); break;
         case SortColumn::Memory:  cmp = (pa.memoryUsage < pb.memoryUsage) ? -1 : (pa.memoryUsage > pb.memoryUsage ? 1 : 0); break;
         case SortColumn::Threads: cmp = (pa.threadCount < pb.threadCount) ? -1 : (pa.threadCount > pb.threadCount ? 1 : 0); break;
-        case SortColumn::Cpu: {
-            float ca = g_cpuUsagePercent.count(pa.pid) ? g_cpuUsagePercent[pa.pid] : 0;
-            float cb = g_cpuUsagePercent.count(pb.pid) ? g_cpuUsagePercent[pb.pid] : 0;
-            cmp = (ca < cb) ? -1 : (ca > cb ? 1 : 0);
+        case SortColumn::Cpu:
+            cmp = (pa.cpuPercent < pb.cpuPercent) ? -1
+                : (pa.cpuPercent > pb.cpuPercent ? 1 : 0);
             break;
-        }
         case SortColumn::User: cmp = _wcsicmp(pa.userName.c_str(), pb.userName.c_str()); break;
         default: cmp = 0;
         }
@@ -464,6 +1205,18 @@ static std::vector<int> GetFilteredStartupIndices() {
     for (int i = 0; i < (int)g_startupEntries.size(); ++i) {
         const auto& s = g_startupEntries[i];
         if (MatchesSearch(s.valueName) || MatchesSearch(s.command)) result.push_back(i);
+    }
+    return result;
+}
+
+static std::vector<int> GetFilteredDriverIndices() {
+    std::vector<int> result;
+    for (int i = 0; i < (int)g_drivers.size(); ++i) {
+        const auto& d = g_drivers[i];
+        if (MatchesSearch(d.serviceName) || MatchesSearch(d.displayName) ||
+            MatchesSearch(d.imagePath)) {
+            result.push_back(i);
+        }
     }
     return result;
 }
@@ -591,38 +1344,49 @@ static void ExecuteProcessCommand(int cmd, const ProcessDisplayInfo& proc) {
     }
 }
 
-static bool ResolveStartupLocation(const StartupRegistry::StartupEntry& entry,StartupEditDialog::Location& out) {
-    using Src = StartupRegistry::StartupSource;
-    // Основные ветки:
-    //   HKCU_Run     → HKEY_CURRENT_USER,  kRun
-    //   HKCU_RunOnce → HKEY_CURRENT_USER,  kRunOnce
-    //   HKLM_Run     → HKEY_LOCAL_MACHINE, kRun
-    //   HKLM_RunOnce → HKEY_LOCAL_MACHINE, kRunOnce
-    static const wchar_t* kRun = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    static const wchar_t* kRunOnce = L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+static bool ResolveStartupLocation(
+    const StartupRegistry::StartupEntry& entry,
+    StartupEditDialog::Location& out)
+{
+    out.root = entry.root;
+    out.subKey = entry.regPath;
+    out.view = entry.view;
 
-    // Заглушка вернуть false
-    /*
+    std::wstring scope = (entry.scope == StartupRegistry::StartupScope::Machine)
+        ? L"HKLM" : L"HKCU";
+    std::wstring src;
     switch (entry.source) {
-    case Src::HKCU_Run:
-        out.root = HKEY_CURRENT_USER;  out.subKey = kRun;
-        out.label = L"HKCU \\ Run";    return true;
-    case Src::HKCU_RunOnce:
-        out.root = HKEY_CURRENT_USER;  out.subKey = kRunOnce;
-        out.label = L"HKCU \\ RunOnce"; return true;
-    case Src::HKLM_Run:
-        out.root = HKEY_LOCAL_MACHINE; out.subKey = kRun;
-        out.label = L"HKLM \\ Run";    return true;
-    case Src::HKLM_RunOnce:
-        out.root = HKEY_LOCAL_MACHINE; out.subKey = kRunOnce;
-        out.label = L"HKLM \\ RunOnce"; return true;
+    case StartupRegistry::StartupSource::Run:         src = L"Run";      break;
+    case StartupRegistry::StartupSource::RunOnce:     src = L"RunOnce";  break;
+    case StartupRegistry::StartupSource::PoliciesRun: src = L"Policies"; break;
+    case StartupRegistry::StartupSource::Winlogon:    src = L"Winlogon"; break;
+    default: src = L"?"; break;
     }
-    */
-    (void)entry; (void)out;
-    return false;
+    out.label = scope + L" \\ " + src;
+    return true;
 }
 
 static void ExecuteServiceCommand(int cmd, const ServiceManager::ServiceInfo& svc) {
+    if (g_servicesOffline) {
+        if (g_offlineMounts.systemMount.empty()) { DoRefresh(); return; }
+        switch (cmd) {
+        case IDM_SVC_AUTO:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, svc.name, SERVICE_AUTO_START);
+            break;
+        case IDM_SVC_MANUAL:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, svc.name, SERVICE_DEMAND_START);
+            break;
+        case IDM_SVC_DISABLED:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, svc.name, SERVICE_DISABLED);
+            break;
+        default: break;
+        }
+        DoRefresh();
+        return;
+    }
     switch (cmd) {
     case IDM_SVC_START:
         ServiceManager::StartService(svc.name);
@@ -650,6 +1414,18 @@ static void ExecuteServiceCommand(int cmd, const ServiceManager::ServiceInfo& sv
         break;
     }
     DoRefresh();
+}
+
+static void EditStartupEntry(const StartupRegistry::StartupEntry& entry) {
+    HWND hwnd = App::Instance()->GetHWND();
+
+    StartupEditDialog::Location loc;
+    if (!ResolveStartupLocation(entry, loc)) {
+        MessageBoxW(hwnd, L"Источник не поддерживает редактирование.", L"Инфо", MB_OK);
+        return;
+    }
+    if (StartupEditDialog::ShowEdit(hwnd, loc, entry.valueName))
+        DoRefresh();
 }
 
 static void ExecuteStartupCommand(int cmd, const StartupRegistry::StartupEntry& entry) {
@@ -690,16 +1466,126 @@ static void ExecuteStartupCommand(int cmd, const StartupRegistry::StartupEntry& 
         }
         break;
     }
-    case IDM_STARTUP_EDIT: {
-        StartupEditDialog::Location loc;
-        if (!ResolveStartupLocation(entry, loc)) {
-            MessageBoxW(hwnd, L"Источник не поддерживает редактирование.", L"Инфо", MB_OK);
-            break;
-        }
-        if (StartupEditDialog::ShowEdit(hwnd, loc, entry.valueName))
-            DoRefresh();
+    case IDM_STARTUP_EDIT:
+        EditStartupEntry(entry);
         break;
     }
+}
+
+static void ExecuteDriverCommand(int cmd, const DriverDisplayInfo& drv) {
+    HWND hwnd = App::Instance()->GetHWND();
+
+    if (g_driversOffline) {
+        if (g_offlineMounts.systemMount.empty()) { DoRefresh(); return; }
+        switch (cmd) {
+        case IDM_DRV_BOOT:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, drv.serviceName, SERVICE_BOOT_START);
+            break;
+        case IDM_DRV_SYSTEM:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, drv.serviceName, SERVICE_SYSTEM_START);
+            break;
+        case IDM_DRV_AUTO:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, drv.serviceName, SERVICE_AUTO_START);
+            break;
+        case IDM_DRV_MANUAL:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, drv.serviceName, SERVICE_DEMAND_START);
+            break;
+        case IDM_DRV_DISABLED:
+            OfflineServiceManager::SetStartType(
+                g_offlineMounts.systemMount, drv.serviceName, SERVICE_DISABLED);
+            break;
+        case IDM_DRV_OPEN_LOC:
+            if (!drv.imagePath.empty())
+                ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                    (L"/select,\"" + drv.imagePath + L"\"").c_str(),
+                    nullptr, SW_SHOWNORMAL);
+            break;
+        case IDM_DRV_COPY_PATH:
+            if (!drv.imagePath.empty()) CopyToClipboard(drv.imagePath);
+            break;
+        case IDM_DRV_VERIFY_SIG: {
+            if (drv.imagePath.empty()) break;
+            std::wstring signer;
+            bool isMs = false, isTrusted = false;
+            auto st = WinCtrl::Scanner::VerifySignature(
+                drv.imagePath, &signer, nullptr, &isMs, &isTrusted, true);
+            std::wstring status;
+            switch (st) {
+            case SigStatus::Valid:    status = L"✓ Подписан"; break;
+            case SigStatus::Unsigned: status = L"— Не подписан"; break;
+            case SigStatus::Invalid:  status = L"✗ Невалидна"; break;
+            case SigStatus::Error:    status = L"? Ошибка"; break;
+            }
+            std::wstring msg = L"Файл: " + drv.imagePath + L"\r\n\r\n";
+            msg += L"Статус: " + status + L"\r\n";
+            if (!signer.empty()) msg += L"Подписант: " + signer + L"\r\n";
+            if (isMs) msg += L"Microsoft: да\r\n";
+            MessageBoxW(hwnd, msg.c_str(), L"Подпись драйвера",
+                MB_OK | MB_ICONINFORMATION);
+            break;
+        }
+        default: break;
+        }
+        DoRefresh();
+        return;
+    }
+    switch (cmd) {
+    case IDM_DRV_OPEN_LOC: {
+        if (drv.imagePath.empty()) {
+            MessageBoxW(hwnd, L"Путь к файлу неизвестен.", L"Инфо", MB_OK);
+            break;
+        }
+        ShellExecuteW(nullptr, L"open", L"explorer.exe",
+            (L"/select,\"" + drv.imagePath + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+        break;
+    }
+    case IDM_DRV_COPY_PATH:
+        if (!drv.imagePath.empty()) CopyToClipboard(drv.imagePath);
+        break;
+
+    case IDM_DRV_VERIFY_SIG: {
+        if (drv.imagePath.empty()) {
+            MessageBoxW(hwnd, L"Путь к файлу неизвестен.", L"Инфо", MB_OK);
+            break;
+        }
+        std::wstring signer;
+        bool isMs = false, isTrusted = false;
+        auto st = WinCtrl::Scanner::VerifySignature(
+            drv.imagePath, &signer, nullptr, &isMs, &isTrusted, true);
+
+        std::wstring status;
+        switch (st) {
+        case SigStatus::Valid:    status = L"✓ Подписан"; break;
+        case SigStatus::Unsigned: status = L"— Не подписан"; break;
+        case SigStatus::Invalid:  status = L"✗ Невалидна"; break;
+        case SigStatus::Error:    status = L"? Ошибка"; break;
+        }
+
+        std::wstring msg = L"Файл: " + drv.imagePath + L"\r\n\r\n";
+        msg += L"Статус: " + status + L"\r\n";
+        if (!signer.empty()) msg += L"Подписант: " + signer + L"\r\n";
+        if (isMs) msg += L"Microsoft: да\r\n";
+        MessageBoxW(hwnd, msg.c_str(), L"Подпись драйвера", MB_OK | MB_ICONINFORMATION);
+        break;
+    }
+
+    case IDM_DRV_EDIT:
+        if (ServiceEditDialog::ShowEdit(hwnd, drv.serviceName, true))
+            DoRefresh();
+        break;
+
+    case IDM_DRV_START:
+        ServiceManager::StartService(drv.serviceName);
+        DoRefresh();
+        break;
+    case IDM_DRV_STOP:
+        ServiceManager::StopService(drv.serviceName);
+        DoRefresh();
+        break;
     }
 }
 
@@ -711,6 +1597,7 @@ static void InitColumnWidths(const RectF& listArea) {
     g_procColWidths[2] = 70.0f;
     g_procColWidths[3] = 90.0f;
     g_procColWidths[4] = 60.0f;
+    g_procColWidths[5] = 40.0f; // Sig
 
     g_svcColWidths[0] = w * 0.40f;
     g_svcColWidths[1] = 120.0f;
@@ -720,6 +1607,13 @@ static void InitColumnWidths(const RectF& listArea) {
     g_startupColWidths[1] = w * 0.35f;
     g_startupColWidths[2] = w * 0.15f;
     g_startupColWidths[3] = w * 0.15f;
+
+    g_driverColWidths[0] = 150.0f;
+    g_driverColWidths[1] = 180.0f;
+    g_driverColWidths[2] = 80.0f;
+    g_driverColWidths[3] = 100.0f;
+    g_driverColWidths[4] = w * 0.35f;
+    g_driverColWidths[5] = 40.0f;
 
     g_colWidthsInitialized = true;
 }
@@ -735,9 +1629,10 @@ static int GetColumnResizeHit(float fx, float fy, const RectF& contentArea) {
     int colCount = 0;
     float* widths = nullptr;
 
-    if (tab == 0) { widths = g_procColWidths; colCount = 5; }
-    else if (tab == 1) { widths = g_svcColWidths; colCount = 3; }
-    else if (tab == 2) { widths = g_startupColWidths; colCount = 4; }
+    if (tab == SUBTAB_PROCESSES) { widths = g_procColWidths; colCount = 6; }
+    else if (tab == SUBTAB_STARTUP) { widths = g_startupColWidths; colCount = 4; }
+    else if (tab == SUBTAB_SERVICES) { widths = g_svcColWidths; colCount = 3; }
+    else if (tab == SUBTAB_DRIVERS) { widths = g_driverColWidths; colCount = 6; }
     else return -1;
 
     for (int i = 0; i < colCount; ++i) {
@@ -792,10 +1687,25 @@ static int GetStartupRowAt(float fx, float fy, const RectF& contentArea) {
     return -1;
 }
 
+static int GetDriverRowAt(float fx, float fy, const RectF& contentArea) {
+    TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
+    if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width ||
+        fy < L.listDataTop || fy > L.listArea.Y + L.listArea.Height) return -1;
+    auto filtered = GetFilteredDriverIndices();
+    int scrollOffset = g_scrollOffset[1];
+    int startRow = scrollOffset / (int)ROW_HEIGHT;
+    float relativeY = fy - L.listDataTop + (scrollOffset % (int)ROW_HEIGHT);
+    if (relativeY < 0) return -1;
+    int row = startRow + (int)(relativeY / ROW_HEIGHT);
+    if (row >= 0 && row < (int)filtered.size()) return filtered[row];
+    return -1;
+}
+
 static SortColumn GetColumnAtHeader(float fx, float fy, const RectF& contentArea) {
     TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     if (fy < L.listArea.Y || fy > L.listArea.Y + 24.0f) return SortColumn::None;
     if (fx < L.listArea.X || fx > L.listArea.X + L.listArea.Width) return SortColumn::None;
+    if (g_activeSubTab != SUBTAB_PROCESSES) return SortColumn::None;
 
     float colX = L.listArea.X + 6.0f;
     SortColumn cols[] = { SortColumn::Pid, SortColumn::Name, SortColumn::Cpu,
@@ -859,17 +1769,19 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
 
     struct ColDef { SortColumn col; const wchar_t* name; };
     ColDef cols[] = {
-        {SortColumn::Pid, L"PID"},
-        {SortColumn::Name, L"Имя процесса"},
-        {SortColumn::Cpu, L"ЦП"},
-        {SortColumn::Memory, L"Память"},
+        {SortColumn::Pid,     L"PID"},
+        {SortColumn::Name,    L"Имя процесса"},
+        {SortColumn::Cpu,     L"ЦП"},
+        {SortColumn::Memory,  L"Память"},
         {SortColumn::Threads, L"Потоки"},
+        {SortColumn::None,    L"Sig"},
     };
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         RectF hr(colX, headerY, g_procColWidths[i], 24.0f);
         std::wstring header = cols[i].name;
-        if (g_sortColumn == cols[i].col) header += g_sortAscending ? L" ▲" : L" ▼";
+        if (cols[i].col != SortColumn::None && g_sortColumn == cols[i].col)
+            header += g_sortAscending ? L" ▲" : L" ▼";
         g.DrawString(header.c_str(), -1, &headFont, hr, &headerFormat, &textBrush);
         colX += g_procColWidths[i];
     }
@@ -878,14 +1790,39 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
     g.DrawLine(&sepPen, L.listArea.X, L.listDataTop - 4.0f,
         L.listArea.X + L.listArea.Width, L.listDataTop - 4.0f);
 
+    SolidBrush sigValid(Color(255, 100, 220, 100));
+    SolidBrush sigUnsigned(Color(255, 160, 160, 160));
+    SolidBrush sigInvalid(Color(255, 240, 80, 80));
+
     int scrollOffset = g_scrollOffset[1];
     DrawScrollableRows(g, L.listArea, L.listDataTop, (int)filtered.size(), scrollOffset,
         [&](int vi, float rowY, bool alternate) {
             int realIdx = filtered[vi];
             const auto& proc = g_processes[realIdx];
             bool selected = (realIdx == g_selectedProcessIndex);
+
+            // Фон по RiskScore (независимо от Sig)
+            Color rowBg = Color(0, 0, 0, 0);
+            bool hasBg = false;
+            if (proc.riskScore >= 10) {
+                rowBg = Color(60, 240, 80, 80);   // красный
+                hasBg = true;
+            }
+            else if (proc.riskScore >= 5) {
+                rowBg = Color(50, 255, 140, 0);  // оранжевый
+                hasBg = true;
+            }
+            else if (proc.riskScore >= 2) {
+                rowBg = Color(40, 255, 200, 80); // жёлтый
+                hasBg = true;
+            }
+
             RectF rowRect(L.listArea.X + 2.0f, rowY, L.listArea.Width - 4.0f, ROW_HEIGHT);
             if (selected) g.FillRectangle(&selBrush, rowRect);
+            else if (hasBg) {
+                SolidBrush bgBrush(rowBg);
+                g.FillRectangle(&bgBrush, rowRect);
+            }
             else if (alternate) {
                 SolidBrush altBrush(Color(255, 38, 38, 38));
                 g.FillRectangle(&altBrush, rowRect);
@@ -906,7 +1843,7 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
             cx += g_procColWidths[1];
 
             RectF c3(cx, rowY, g_procColWidths[2], ROW_HEIGHT);
-            float cpu = g_cpuUsagePercent.count(proc.pid) ? g_cpuUsagePercent[proc.pid] : 0.0f;
+            float cpu = proc.cpuPercent;
             SolidBrush cpuHighBrush(Color(255, 255, 100, 100));
             SolidBrush* cpuBrush = (cpu > 50.0f) ? &cpuHighBrush : &mutedBrush;
             g.DrawString(FormatCpu(cpu).c_str(), -1, &smallFont, c3, &f, cpuBrush);
@@ -918,64 +1855,24 @@ static void DrawProcesses(Graphics& g, const TaskmgrLayout& L,
 
             RectF c5(cx, rowY, g_procColWidths[4], ROW_HEIGHT);
             g.DrawString(std::to_wstring(proc.threadCount).c_str(), -1, &smallFont, c5, &f, &mutedBrush);
-        });
-    g_scrollOffset[1] = scrollOffset;
-}
+            cx += g_procColWidths[4];
 
-static void DrawServices(Graphics& g, const TaskmgrLayout& L,
-    Font& headFont, Font& itemFont, Font& smallFont,
-    SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
-
-    auto filtered = GetFilteredServiceIndices();
-
-    float colX = L.listArea.X + 6.0f;
-    float headerY = L.listArea.Y + 4.0f;
-    StringFormat hf; hf.SetAlignment(StringAlignmentNear); hf.SetLineAlignment(StringAlignmentCenter);
-    hf.SetTrimming(StringTrimmingEllipsisCharacter);
-
-    const wchar_t* headers[] = { L"Служба", L"Статус", L"Тип запуска" };
-    for (int i = 0; i < 3; ++i) {
-        RectF hr(colX, headerY, g_svcColWidths[i], 24.0f);
-        g.DrawString(headers[i], -1, &headFont, hr, &hf, &textBrush);
-        colX += g_svcColWidths[i];
-    }
-
-    Pen sepPen(COLOR_BORDER, 1.0f);
-    g.DrawLine(&sepPen, L.listArea.X, L.listDataTop - 4.0f,
-        L.listArea.X + L.listArea.Width, L.listDataTop - 4.0f);
-
-    int scrollOffset = g_scrollOffset[1];
-    DrawScrollableRows(g, L.listArea, L.listDataTop, (int)filtered.size(), scrollOffset,
-        [&](int vi, float rowY, bool alternate) {
-            int realIdx = filtered[vi];
-            const auto& svc = g_services[realIdx];
-            bool selected = (realIdx == g_selectedServiceIndex);
-            RectF rowRect(L.listArea.X + 2.0f, rowY, L.listArea.Width - 4.0f, ROW_HEIGHT);
-            if (selected) g.FillRectangle(&selBrush, rowRect);
-            else if (alternate) {
-                SolidBrush altBrush(Color(255, 38, 38, 38));
-                g.FillRectangle(&altBrush, rowRect);
+            RectF c6(cx, rowY, g_procColWidths[5], ROW_HEIGHT);
+            if (!proc.sigChecked) {
+                SolidBrush dot(Color(255, 90, 90, 90));
+                g.FillEllipse(&dot, RectF(cx + 14.0f, rowY + 10.0f, 5.0f, 5.0f));
             }
-            float cx = L.listArea.X + 6.0f;
-            StringFormat f; f.SetAlignment(StringAlignmentNear); f.SetLineAlignment(StringAlignmentCenter);
-            f.SetTrimming(StringTrimmingEllipsisCharacter);
+            else {
+                SolidBrush* b = &sigUnsigned;
+                const wchar_t* sym = L"—";
+                if (proc.sigValid) { b = &sigValid;    sym = L"✓"; }
+                else if (proc.sigInvalid) { b = &sigInvalid;  sym = L"✗"; }
 
-            RectF c1(cx, rowY, g_svcColWidths[0], ROW_HEIGHT);
-            g.DrawString(svc.displayName.c_str(), -1, &itemFont, c1, &f, &textBrush);
-            cx += g_svcColWidths[0];
-
-            RectF c2(cx, rowY, g_svcColWidths[1], ROW_HEIGHT);
-            std::wstring status = ServiceStatusToString(svc.state);
-            SolidBrush runBrush(Color(255, 100, 220, 100));
-            SolidBrush stopBrush(Color(255, 200, 100, 100));
-            SolidBrush* statusBrush = &mutedBrush;
-            if (svc.state == ServiceManager::ServiceState::Running) statusBrush = &runBrush;
-            else if (svc.state == ServiceManager::ServiceState::Stopped) statusBrush = &stopBrush;
-            g.DrawString(status.c_str(), -1, &smallFont, c2, &f, statusBrush);
-            cx += g_svcColWidths[1];
-
-            RectF c3(cx, rowY, g_svcColWidths[2], ROW_HEIGHT);
-            g.DrawString(ServiceStartTypeToString(svc.startType).c_str(), -1, &smallFont, c3, &f, &mutedBrush);
+                StringFormat cf;
+                cf.SetAlignment(StringAlignmentCenter);
+                cf.SetLineAlignment(StringAlignmentCenter);
+                g.DrawString(sym, -1, &itemFont, c6, &cf, b);
+            }
         });
     g_scrollOffset[1] = scrollOffset;
 }
@@ -1042,19 +1939,178 @@ static void DrawStartup(Graphics& g, const TaskmgrLayout& L,
     g_scrollOffset[1] = scrollOffset;
 }
 
+static void DrawServices(Graphics& g, const TaskmgrLayout& L,
+    Font& headFont, Font& itemFont, Font& smallFont,
+    SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
+
+    auto filtered = GetFilteredServiceIndices();
+
+    float colX = L.listArea.X + 6.0f;
+    float headerY = L.listArea.Y + 4.0f;
+    StringFormat hf; hf.SetAlignment(StringAlignmentNear); hf.SetLineAlignment(StringAlignmentCenter);
+    hf.SetTrimming(StringTrimmingEllipsisCharacter);
+
+    const wchar_t* headers[] = { L"Служба", L"Статус", L"Тип запуска" };
+    for (int i = 0; i < 3; ++i) {
+        RectF hr(colX, headerY, g_svcColWidths[i], 24.0f);
+        g.DrawString(headers[i], -1, &headFont, hr, &hf, &textBrush);
+        colX += g_svcColWidths[i];
+    }
+
+    Pen sepPen(COLOR_BORDER, 1.0f);
+    g.DrawLine(&sepPen, L.listArea.X, L.listDataTop - 4.0f,
+        L.listArea.X + L.listArea.Width, L.listDataTop - 4.0f);
+
+    int scrollOffset = g_scrollOffset[1];
+    DrawScrollableRows(g, L.listArea, L.listDataTop, (int)filtered.size(), scrollOffset,
+        [&](int vi, float rowY, bool alternate) {
+            int realIdx = filtered[vi];
+            const auto& svc = g_services[realIdx];
+            bool selected = (realIdx == g_selectedServiceIndex);
+            RectF rowRect(L.listArea.X + 2.0f, rowY, L.listArea.Width - 4.0f, ROW_HEIGHT);
+            if (selected) g.FillRectangle(&selBrush, rowRect);
+            else if (alternate) {
+                SolidBrush altBrush(Color(255, 38, 38, 38));
+                g.FillRectangle(&altBrush, rowRect);
+            }
+            float cx = L.listArea.X + 6.0f;
+            StringFormat f; f.SetAlignment(StringAlignmentNear); f.SetLineAlignment(StringAlignmentCenter);
+            f.SetTrimming(StringTrimmingEllipsisCharacter);
+
+            RectF c1(cx, rowY, g_svcColWidths[0], ROW_HEIGHT);
+            g.DrawString(svc.displayName.c_str(), -1, &itemFont, c1, &f, &textBrush);
+            cx += g_svcColWidths[0];
+
+            RectF c2(cx, rowY, g_svcColWidths[1], ROW_HEIGHT);
+            std::wstring status = g_servicesOffline
+                ? std::wstring(L"—")
+                : ServiceStatusToString(svc.state);
+            SolidBrush runBrush(Color(255, 100, 220, 100));
+            SolidBrush stopBrush(Color(255, 200, 100, 100));
+            SolidBrush* statusBrush = &mutedBrush;
+            if (svc.state == ServiceManager::ServiceState::Running) statusBrush = &runBrush;
+            else if (svc.state == ServiceManager::ServiceState::Stopped) statusBrush = &stopBrush;
+            g.DrawString(status.c_str(), -1, &smallFont, c2, &f, statusBrush);
+            cx += g_svcColWidths[1];
+
+            RectF c3(cx, rowY, g_svcColWidths[2], ROW_HEIGHT);
+            g.DrawString(ServiceStartTypeToString(svc.startType).c_str(), -1, &smallFont, c3, &f, &mutedBrush);
+        });
+    g_scrollOffset[1] = scrollOffset;
+}
+
+static void DrawDrivers(Graphics& g, const TaskmgrLayout& L,
+    Font& headFont, Font& itemFont, Font& smallFont,
+    SolidBrush& textBrush, SolidBrush& mutedBrush, SolidBrush& selBrush) {
+
+    auto filtered = GetFilteredDriverIndices();
+
+    float colX = L.listArea.X + 6.0f;
+    float headerY = L.listArea.Y + 4.0f;
+    StringFormat hf; hf.SetAlignment(StringAlignmentNear); hf.SetLineAlignment(StringAlignmentCenter);
+    hf.SetTrimming(StringTrimmingEllipsisCharacter);
+
+    const wchar_t* headers[] = { L"Драйвер", L"Отображаемое имя", L"Старт", L"Состояние", L"Путь", L"Sig" };
+    for (int i = 0; i < 6; ++i) {
+        RectF hr(colX, headerY, g_driverColWidths[i], 24.0f);
+        g.DrawString(headers[i], -1, &headFont, hr, &hf, &textBrush);
+        colX += g_driverColWidths[i];
+    }
+
+    Pen sepPen(COLOR_BORDER, 1.0f);
+    g.DrawLine(&sepPen, L.listArea.X, L.listDataTop - 4.0f,
+        L.listArea.X + L.listArea.Width, L.listDataTop - 4.0f);
+
+    SolidBrush sigValid(Color(255, 100, 220, 100));
+    SolidBrush sigUnsigned(Color(255, 160, 160, 160));
+    SolidBrush sigInvalid(Color(255, 240, 80, 80));
+
+    int scrollOffset = g_scrollOffset[1];
+    DrawScrollableRows(g, L.listArea, L.listDataTop, (int)filtered.size(), scrollOffset,
+        [&](int vi, float rowY, bool alternate) {
+            int realIdx = filtered[vi];
+            const auto& drv = g_drivers[realIdx];
+            bool selected = (realIdx == g_selectedDriverIndex);
+
+            // Подсветка строки по вердикту подписи
+            Color rowBg = Color(0, 0, 0, 0);
+            bool hasBg = false;
+
+            if (drv.sigChecked) {
+                if (drv.sigInvalid || (!drv.sigValid && drv.sigMicrosoft)) {
+                    // битая подпись Microsoft
+                    rowBg = Color(60, 240, 80, 80);
+                    hasBg = true;
+                }
+                else if (!drv.sigValid && !drv.sigMicrosoft) {
+                    // не подписан
+                    rowBg = Color(40, 255, 200, 80);
+                    hasBg = true;
+                }
+            }
+
+            RectF rowRect(L.listArea.X + 2.0f, rowY, L.listArea.Width - 4.0f, ROW_HEIGHT);
+            if (selected) g.FillRectangle(&selBrush, rowRect);
+            else if (hasBg) {
+                SolidBrush bgBrush(rowBg);
+                g.FillRectangle(&bgBrush, rowRect);
+            }
+            else if (alternate) {
+                SolidBrush altBrush(Color(255, 38, 38, 38));
+                g.FillRectangle(&altBrush, rowRect);
+            }
+
+            float cx = L.listArea.X + 6.0f;
+            StringFormat f; f.SetAlignment(StringAlignmentNear); f.SetLineAlignment(StringAlignmentCenter);
+            f.SetTrimming(StringTrimmingEllipsisCharacter);
+
+            RectF c1(cx, rowY, g_driverColWidths[0], ROW_HEIGHT);
+            g.DrawString(drv.serviceName.c_str(), -1, &itemFont, c1, &f, &textBrush);
+            cx += g_driverColWidths[0];
+
+            RectF c2(cx, rowY, g_driverColWidths[1], ROW_HEIGHT);
+            g.DrawString(drv.displayName.c_str(), -1, &smallFont, c2, &f, &mutedBrush);
+            cx += g_driverColWidths[1];
+
+            RectF c3(cx, rowY, g_driverColWidths[2], ROW_HEIGHT);
+            g.DrawString(DriverStartTypeToString(drv.startType).c_str(), -1, &smallFont, c3, &f, &mutedBrush);
+            cx += g_driverColWidths[2];
+
+            RectF c4(cx, rowY, g_driverColWidths[3], ROW_HEIGHT);
+            SolidBrush runBrush(Color(255, 100, 220, 100));
+            SolidBrush* stateBrush = (drv.state == SERVICE_RUNNING) ? &runBrush : &mutedBrush;
+            std::wstring stateStr = g_driversOffline
+                ? std::wstring(L"—")
+                : DriverStateToString(drv.state);
+            g.DrawString(stateStr.c_str(), -1, &smallFont, c4, &f, stateBrush);
+            cx += g_driverColWidths[3];
+
+            RectF c5(cx, rowY, g_driverColWidths[4], ROW_HEIGHT);
+            g.DrawString(drv.imagePath.c_str(), -1, &smallFont, c5, &f, &mutedBrush);
+            cx += g_driverColWidths[4];
+
+            RectF c6(cx, rowY, g_driverColWidths[5], ROW_HEIGHT);
+            if (!drv.sigChecked) {
+                SolidBrush dot(Color(255, 90, 90, 90));
+                g.FillEllipse(&dot, RectF(cx + 14.0f, rowY + 10.0f, 5.0f, 5.0f));
+            }
+            else {
+                SolidBrush* b = &sigUnsigned;
+                const wchar_t* sym = L"—";
+                if (drv.sigValid) { b = &sigValid;    sym = L"✓"; }
+                else if (drv.sigInvalid) { b = &sigInvalid; sym = L"✗"; }
+
+                StringFormat cf;
+                cf.SetAlignment(StringAlignmentCenter);
+                cf.SetLineAlignment(StringAlignmentCenter);
+                g.DrawString(sym, -1, &itemFont, c6, &cf, b);
+            }
+        });
+    g_scrollOffset[1] = scrollOffset;
+}
+
 void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& contentFont) {
     (void)contentFont;
-
-    if (IsLikelyRecoveryEnvironment()) {
-#if TASKMGR_SHOW_RECOVERY_MESSAGE
-        FontFamily ff(g_fontFamilyName.c_str());
-        Font mf(&ff, 13.0f, FontStyleRegular, UnitPixel);
-        SolidBrush mb(COLOR_TEXT_MUTED);
-        StringFormat cf; cf.SetAlignment(StringAlignmentCenter); cf.SetLineAlignment(StringAlignmentCenter);
-        g.DrawString(L"Возможно, вы в среде восстановления", -1, &mf, contentArea, &cf, &mb);
-#endif
-        return;
-    }
 
     static int lastMainTab = -1;
     if (g_activeMainTab == 1 && lastMainTab != 1) {
@@ -1085,12 +2141,15 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     TaskmgrLayout L = GetLayout(contentArea, g_subTabsExpanded);
     InitColumnWidths(L.listArea);
 
+    // Подвкладки
     if (g_subTabsExpanded) {
-        const wchar_t* subNames[3] = { L"Процессы", L"Службы", L"Автозагрузка" };
+        const wchar_t* subNames[SUBTAB_COUNT] = {
+            L"Процессы", L"Автозагрузки", L"Службы", L"Драйвера"
+        };
         float subtabX = L.subTabs.X + 4.0f;
         float subtabY = L.subTabs.Y + 2.0f;
-        float subtabW = (L.subTabs.Width - 8.0f) / 3.0f - 4.0f;
-        for (int i = 0; i < 3; ++i) {
+        float subtabW = (L.subTabs.Width - 8.0f) / (float)SUBTAB_COUNT - 4.0f;
+        for (int i = 0; i < SUBTAB_COUNT; ++i) {
             RectF tabRect(subtabX + i * (subtabW + 4.0f), subtabY, subtabW, SUBTAB_HEIGHT - 4.0f);
             g_subTabRects[i] = tabRect;
             Color bg = (i == g_activeSubTab) ? COLOR_TAB_ACTIVE : COLOR_TAB_BG;
@@ -1110,16 +2169,20 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     float btnH = 26.0f;
     int tab = g_activeSubTab;
 
-    if (tab == 0) {
+    if (tab == SUBTAB_PROCESSES && !IsLikelyRecoveryEnvironment()) {
         g_btnEndProcess = RectF(x, y, 150.0f, btnH);
         DrawButton(g, g_btnEndProcess, L"Завершить процесс", itemFont, bgBrush, textBrush, borderPen);
         x += 156.0f;
     }
+    else {
+        g_btnEndProcess = RectF(0, 0, 0, 0);
+    }
+
     g_btnRefresh = RectF(x, y, 90.0f, btnH);
     DrawButton(g, g_btnRefresh, L"Обновить", itemFont, bgBrush, textBrush, borderPen);
     x += 96.0f;
 
-    if (tab == 1 || tab == 2) {
+    if (tab == SUBTAB_STARTUP || tab == SUBTAB_SERVICES) {
         g_btnCreate = RectF(x, y, 90.0f, btnH);
         DrawButton(g, g_btnCreate, L"Создать", itemFont, bgBrush, textBrush, borderPen);
         x += 96.0f;
@@ -1130,20 +2193,34 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
 
     SystemStatsEx stats = GetSystemStatsEx();
     std::wstring countText;
-    if (tab == 0) {
-        countText = L"Процессов: " + std::to_wstring(stats.totalProcesses) +
-            L"  |  RAM: " + FormatMemory(stats.usedRam) + L" / " + FormatMemory(stats.totalRam) +
-            L"  |  ЦП: " + FormatCpu(stats.cpuUsagePercent);
+    if (tab == SUBTAB_PROCESSES) {
+        if (IsLikelyRecoveryEnvironment()) {
+            countText = L"Недоступно в среде восстановления";
+        }
+        else {
+            countText = L"Процессов: " + std::to_wstring(stats.totalProcesses) +
+                L"  |  RAM: " + FormatMemory(stats.usedRam) + L" / " + FormatMemory(stats.totalRam) +
+                L"  |  ЦП: " + FormatCpu(stats.cpuUsagePercent);
+        }
     }
-    else if (tab == 1) {
+    else if (tab == SUBTAB_STARTUP) {
+        countText = L"Записей: " + std::to_wstring(g_startupEntries.size());
+    }
+    else if (tab == SUBTAB_SERVICES) {
         int running = 0;
-        for (const auto& s : g_services) if (s.state == ServiceManager::ServiceState::Running) running++;
+        for (const auto& s : g_services)
+            if (s.state == ServiceManager::ServiceState::Running) running++;
         countText = L"Служб: " + std::to_wstring(g_services.size()) +
             L"  |  Работает: " + std::to_wstring(running);
     }
     else {
-        countText = L"Записей: " + std::to_wstring(g_startupEntries.size());
+        int running = 0;
+        for (const auto& d : g_drivers)
+            if (d.state == SERVICE_RUNNING) running++;
+        countText = L"Драйверов: " + std::to_wstring(g_drivers.size()) +
+            L"  |  Работает: " + std::to_wstring(running);
     }
+
     RectF countRect(x, y, L.toolbar.Width - (x - L.toolbar.X) - 4.0f, btnH);
     StringFormat leftF; leftF.SetAlignment(StringAlignmentNear); leftF.SetLineAlignment(StringAlignmentCenter);
     g.DrawString(countText.c_str(), -1, &smallFont, countRect, &leftF, &mutedBrush);
@@ -1164,20 +2241,39 @@ void DrawTaskManagerContent(Graphics& g, const RectF& contentArea, Font& content
     g.DrawRectangle(&borderPen, L.listArea);
 
     switch (tab) {
-    case 0: DrawProcesses(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush); break;
-    case 1: DrawServices(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush); break;
-    case 2: DrawStartup(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush); break;
+    case SUBTAB_PROCESSES:
+        if (IsLikelyRecoveryEnvironment()) {
+#if TASKMGR_SHOW_RECOVERY_MESSAGE
+            SolidBrush mb(COLOR_TEXT_MUTED);
+            StringFormat cf; cf.SetAlignment(StringAlignmentCenter); cf.SetLineAlignment(StringAlignmentCenter);
+            g.DrawString(L"Процессы недоступны в среде восстановления", -1, &itemFont,
+                L.listArea, &cf, &mb);
+#endif
+        }
+        else {
+            DrawProcesses(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush);
+        }
+        break;
+    case SUBTAB_STARTUP:
+        DrawStartup(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush);
+        break;
+    case SUBTAB_SERVICES:
+        DrawServices(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush);
+        break;
+    case SUBTAB_DRIVERS:
+        DrawDrivers(g, L, headFont, itemFont, smallFont, textBrush, mutedBrush, selBrush);
+        break;
     }
 }
 
 bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
-    if (IsLikelyRecoveryEnvironment()) return false;
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
     int tab = g_activeSubTab;
+    bool inWinRE = IsLikelyRecoveryEnvironment();
 
     if (g_subTabsExpanded) {
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < SUBTAB_COUNT; ++i) {
             if (HitTestRect(g_subTabRects[i], fx, fy)) {
                 if (g_activeSubTab != i) {
                     g_activeSubTab = i;
@@ -1194,15 +2290,17 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         g_resizingColIndex = resizeCol;
         g_resizingStartX = fx;
         float* widths = nullptr;
-        if (tab == 0) widths = g_procColWidths;
-        else if (tab == 1) widths = g_svcColWidths;
-        else if (tab == 2) widths = g_startupColWidths;
+        if (tab == SUBTAB_PROCESSES) widths = g_procColWidths;
+        else if (tab == SUBTAB_STARTUP) widths = g_startupColWidths;
+        else if (tab == SUBTAB_SERVICES) widths = g_svcColWidths;
+        else if (tab == SUBTAB_DRIVERS) widths = g_driverColWidths;
         if (widths) g_resizingStartWidth = widths[resizeCol];
         SetCapture(App::Instance()->GetHWND());
         return true;
     }
 
-    if (tab == 0 && fx >= g_btnEndProcess.X && fx <= g_btnEndProcess.X + g_btnEndProcess.Width &&
+    if (g_btnEndProcess.Width > 0.0f &&
+        fx >= g_btnEndProcess.X && fx <= g_btnEndProcess.X + g_btnEndProcess.Width &&
         fy >= g_btnEndProcess.Y && fy <= g_btnEndProcess.Y + g_btnEndProcess.Height) {
         if (g_selectedProcessIndex >= 0 && g_selectedProcessIndex < (int)g_processes.size()) {
             ExecuteProcessCommand(IDM_PROC_TERMINATE, g_processes[g_selectedProcessIndex]);
@@ -1221,12 +2319,24 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
     if (g_btnCreate.Width > 0.0f &&
         fx >= g_btnCreate.X && fx <= g_btnCreate.X + g_btnCreate.Width &&
         fy >= g_btnCreate.Y && fy <= g_btnCreate.Y + g_btnCreate.Height) {
-        if (tab == 1) {
-            if (ServiceEditDialog::ShowCreate(App::Instance()->GetHWND()))
-                DoRefresh();
+        if (tab == SUBTAB_STARTUP) {
+            bool created = false;
+            if (inWinRE) {
+                auto locs = BuildOfflineStartupLocations();
+                if (!locs.empty())
+                    created = StartupEditDialog::ShowCreate(App::Instance()->GetHWND(), locs);
+                else
+                    MessageBoxW(App::Instance()->GetHWND(),
+                        L"Офлайн-кусты реестра не смонтированы.",
+                        L"Автозагрузки", MB_OK | MB_ICONINFORMATION);
+            }
+            else {
+                created = StartupEditDialog::ShowCreate(App::Instance()->GetHWND());
+            }
+            if (created) DoRefresh();
         }
-        else if (tab == 2) {
-            if (StartupEditDialog::ShowCreate(App::Instance()->GetHWND()))
+        else if (tab == SUBTAB_SERVICES) {
+            if (ServiceEditDialog::ShowCreate(App::Instance()->GetHWND()))
                 DoRefresh();
         }
         return true;
@@ -1241,7 +2351,7 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         g_searchActive = false;
     }
 
-    if (tab == 0) {
+    if (tab == SUBTAB_PROCESSES) {
         SortColumn col = GetColumnAtHeader(fx, fy, contentArea);
         if (col != SortColumn::None) {
             if (g_sortColumn == col) g_sortAscending = !g_sortAscending;
@@ -1251,15 +2361,24 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
         }
     }
 
-    if (tab == 0) {
+    if (tab == SUBTAB_PROCESSES && !inWinRE) {
         int row = GetProcessRowAt(fx, fy, contentArea);
         if (row >= 0) {
             g_selectedProcessIndex = row;
+            LoadProcessDetails(row);
             InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
             return true;
         }
     }
-    else if (tab == 1) {
+    else if (tab == SUBTAB_STARTUP) {
+        int row = GetStartupRowAt(fx, fy, contentArea);
+        if (row >= 0) {
+            g_selectedStartupIndex = row;
+            InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
+            return true;
+        }
+    }
+    else if (tab == SUBTAB_SERVICES) {
         int row = GetServiceRowAt(fx, fy, contentArea);
         if (row >= 0) {
             g_selectedServiceIndex = row;
@@ -1267,10 +2386,11 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
             return true;
         }
     }
-    else if (tab == 2) {
-        int row = GetStartupRowAt(fx, fy, contentArea);
+    else if (tab == SUBTAB_DRIVERS) {
+        int row = GetDriverRowAt(fx, fy, contentArea);
         if (row >= 0) {
-            g_selectedStartupIndex = row;
+            g_selectedDriverIndex = row;
+            LoadDriverSignature(row);
             InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
             return true;
         }
@@ -1279,16 +2399,16 @@ bool OnTaskManagerClick(int x, int y, const RectF& contentArea) {
 }
 
 bool OnTaskManagerMouseMove(int x, int y, const RectF& contentArea) {
-    if (IsLikelyRecoveryEnvironment()) return false;
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
     int tab = g_activeSubTab;
 
     if (g_resizingColIndex >= 0) {
         float* widths = nullptr;
-        if (tab == 0) widths = g_procColWidths;
-        else if (tab == 1) widths = g_svcColWidths;
-        else if (tab == 2) widths = g_startupColWidths;
+        if (tab == SUBTAB_PROCESSES) widths = g_procColWidths;
+        else if (tab == SUBTAB_STARTUP) widths = g_startupColWidths;
+        else if (tab == SUBTAB_SERVICES) widths = g_svcColWidths;
+        else if (tab == SUBTAB_DRIVERS) widths = g_driverColWidths;
 
         if (widths) {
             float delta = fx - g_resizingStartX;
@@ -1322,16 +2442,17 @@ bool OnTaskManagerLButtonUp() {
 }
 
 bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
-    if (IsLikelyRecoveryEnvironment()) return false;
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
     HWND hwnd = App::Instance()->GetHWND();
     int tab = g_activeSubTab;
+    bool inWinRE = IsLikelyRecoveryEnvironment();
 
-    if (tab == 0) {
+    if (tab == SUBTAB_PROCESSES && !inWinRE) {
         int row = GetProcessRowAt(fx, fy, contentArea);
         if (row < 0) return false;
         g_selectedProcessIndex = row;
+        LoadProcessDetails(row);
         InvalidateRect(hwnd, nullptr, TRUE);
         if (row >= (int)g_processes.size()) return false;
         const auto& proc = g_processes[row];
@@ -1386,35 +2507,7 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         if (cmd) ExecuteProcessCommand(cmd, proc);
         return true;
     }
-    else if (tab == 1) {
-        int row = GetServiceRowAt(fx, fy, contentArea);
-        if (row < 0) return false;
-        g_selectedServiceIndex = row;
-        InvalidateRect(hwnd, nullptr, TRUE);
-        if (row >= (int)g_services.size()) return false;
-        const auto& svc = g_services[row];
-
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Stopped ? MF_STRING : MF_GRAYED, IDM_SVC_START, L"Запустить");
-        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Running ? MF_STRING : MF_GRAYED, IDM_SVC_STOP, L"Остановить");
-        AppendMenuW(menu, svc.state == ServiceManager::ServiceState::Running ? MF_STRING : MF_GRAYED, IDM_SVC_RESTART, L"Перезапустить");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        HMENU stMenu = CreatePopupMenu();
-        AppendMenuW(stMenu, MF_STRING, IDM_SVC_AUTO, L"Автоматически");
-        AppendMenuW(stMenu, MF_STRING, IDM_SVC_MANUAL, L"Вручную");
-        AppendMenuW(stMenu, MF_STRING, IDM_SVC_DISABLED, L"Отключена");
-        AppendMenuW(menu, MF_POPUP, (UINT_PTR)stMenu, L"Тип запуска");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, IDM_SVC_EDIT, L"Изменить...");
-
-        POINT pt{ x, y }; ClientToScreen(hwnd, &pt);
-        SetForegroundWindow(hwnd);
-        int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
-        if (cmd) ExecuteServiceCommand(cmd, svc);
-        return true;
-    }
-    else if (tab == 2) {
+    else if (tab == SUBTAB_STARTUP) {
         int row = GetStartupRowAt(fx, fy, contentArea);
         if (row < 0) return false;
         g_selectedStartupIndex = row;
@@ -1438,17 +2531,140 @@ bool OnTaskManagerRightClick(int x, int y, const RectF& contentArea) {
         if (cmd) ExecuteStartupCommand(cmd, entry);
         return true;
     }
+    else if (tab == SUBTAB_SERVICES) {
+        int row = GetServiceRowAt(fx, fy, contentArea);
+        if (row < 0) return false;
+        g_selectedServiceIndex = row;
+        InvalidateRect(hwnd, nullptr, TRUE);
+        if (row >= (int)g_services.size()) return false;
+        const auto& svc = g_services[row];
+
+        HMENU menu = CreatePopupMenu();
+
+        UINT startFlag = svc.state == ServiceManager::ServiceState::Stopped ? MF_STRING : MF_GRAYED;
+        UINT stopFlag = svc.state == ServiceManager::ServiceState::Running ? MF_STRING : MF_GRAYED;
+        if (g_servicesOffline) startFlag = stopFlag = MF_GRAYED;
+
+        AppendMenuW(menu, startFlag, IDM_SVC_START, L"Запустить");
+        AppendMenuW(menu, stopFlag, IDM_SVC_STOP, L"Остановить");
+        AppendMenuW(menu, stopFlag, IDM_SVC_RESTART, L"Перезапустить");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+        HMENU stMenu = CreatePopupMenu();
+        AppendMenuW(stMenu, MF_STRING, IDM_SVC_AUTO, L"Автоматически");
+        AppendMenuW(stMenu, MF_STRING, IDM_SVC_MANUAL, L"Вручную");
+        AppendMenuW(stMenu, MF_STRING, IDM_SVC_DISABLED, L"Отключена");
+
+        UINT checkedId = 0;
+        switch (svc.startType) {
+        case ServiceManager::ServiceStartType::Auto:     checkedId = IDM_SVC_AUTO;     break;
+        case ServiceManager::ServiceStartType::Demand:   checkedId = IDM_SVC_MANUAL;   break;
+        case ServiceManager::ServiceStartType::Disabled: checkedId = IDM_SVC_DISABLED; break;
+        default: break;
+        }
+        if (checkedId)
+            CheckMenuRadioItem(stMenu, IDM_SVC_AUTO, IDM_SVC_DISABLED, checkedId, MF_BYCOMMAND);
+
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)stMenu, L"Тип запуска");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_SVC_EDIT, L"Изменить...");
+
+        POINT pt{ x, y }; ClientToScreen(hwnd, &pt);
+        SetForegroundWindow(hwnd);
+        int cmd = TrackPopupMenu(menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(menu);
+        if (cmd) ExecuteServiceCommand(cmd, svc);
+        return true;
+    }
+    else if (tab == SUBTAB_DRIVERS) {
+        int row = GetDriverRowAt(fx, fy, contentArea);
+        if (row < 0) return false;
+        g_selectedDriverIndex = row;
+        LoadDriverSignature(row);
+        InvalidateRect(hwnd, nullptr, TRUE);
+        if (row >= (int)g_drivers.size()) return false;
+        const auto& drv = g_drivers[row];
+
+        HMENU menu = CreatePopupMenu();
+        bool hasPath = !drv.imagePath.empty();
+
+        AppendMenuW(menu, hasPath ? MF_STRING : MF_GRAYED,
+            IDM_DRV_OPEN_LOC, L"Открыть расположение");
+        AppendMenuW(menu, hasPath ? MF_STRING : MF_GRAYED,
+            IDM_DRV_COPY_PATH, L"Копировать путь");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, hasPath ? MF_STRING : MF_GRAYED,
+            IDM_DRV_VERIFY_SIG, L"Проверить подпись");
+
+        if (g_driversOffline) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            HMENU stMenu = CreatePopupMenu();
+            AppendMenuW(stMenu, MF_STRING, IDM_DRV_BOOT, L"Boot");
+            AppendMenuW(stMenu, MF_STRING, IDM_DRV_SYSTEM, L"System");
+            AppendMenuW(stMenu, MF_STRING, IDM_DRV_AUTO, L"Авто");
+            AppendMenuW(stMenu, MF_STRING, IDM_DRV_MANUAL, L"Вручную");
+            AppendMenuW(stMenu, MF_STRING, IDM_DRV_DISABLED, L"Отключена");
+
+            UINT checkedId = 0;
+            switch (drv.startType) {
+            case SERVICE_BOOT_START:   checkedId = IDM_DRV_BOOT;     break;
+            case SERVICE_SYSTEM_START: checkedId = IDM_DRV_SYSTEM;   break;
+            case SERVICE_AUTO_START:   checkedId = IDM_DRV_AUTO;     break;
+            case SERVICE_DEMAND_START: checkedId = IDM_DRV_MANUAL;   break;
+            case SERVICE_DISABLED:     checkedId = IDM_DRV_DISABLED; break;
+            }
+            if (checkedId)
+                CheckMenuRadioItem(stMenu, IDM_DRV_BOOT, IDM_DRV_DISABLED,
+                    checkedId, MF_BYCOMMAND);
+
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)stMenu, L"Тип запуска");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_GRAYED, IDM_DRV_EDIT, L"Изменить...");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_GRAYED, IDM_DRV_START, L"Запустить службу");
+            AppendMenuW(menu, MF_GRAYED, IDM_DRV_STOP, L"Остановить службу");
+        }
+        else {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, IDM_DRV_EDIT, L"Изменить...");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, drv.state == SERVICE_STOPPED ? MF_STRING : MF_GRAYED,
+                IDM_DRV_START, L"Запустить службу");
+            AppendMenuW(menu, drv.state == SERVICE_RUNNING ? MF_STRING : MF_GRAYED,
+                IDM_DRV_STOP, L"Остановить службу");
+        }
+
+        POINT pt{ x, y }; ClientToScreen(hwnd, &pt);
+        SetForegroundWindow(hwnd);
+        int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(menu);
+        if (cmd) ExecuteDriverCommand(cmd, drv);
+        return true;
+    }
     return false;
 }
 
 bool OnTaskManagerDblClick(int x, int y, const RectF& contentArea) {
-    if (IsLikelyRecoveryEnvironment()) return false;
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
     int tab = g_activeSubTab;
     HWND hwnd = App::Instance()->GetHWND();
+    bool inWinRE = IsLikelyRecoveryEnvironment();
 
-    if (tab == 1) {
+    if (tab == SUBTAB_PROCESSES && inWinRE) return false;
+
+    if (tab == SUBTAB_STARTUP) {
+        int row = GetStartupRowAt(fx, fy, contentArea);
+        if (row >= 0 && row < (int)g_startupEntries.size()) {
+            g_selectedStartupIndex = row;
+            EditStartupEntry(g_startupEntries[row]);
+            return true;
+        }
+    }
+    else if (tab == SUBTAB_SERVICES) {
         int row = GetServiceRowAt(fx, fy, contentArea);
         if (row >= 0 && row < (int)g_services.size()) {
             g_selectedServiceIndex = row;
@@ -1457,18 +2673,13 @@ bool OnTaskManagerDblClick(int x, int y, const RectF& contentArea) {
             return true;
         }
     }
-    else if (tab == 2) {
-        int row = GetStartupRowAt(fx, fy, contentArea);
-        if (row >= 0 && row < (int)g_startupEntries.size()) {
-            g_selectedStartupIndex = row;
-            StartupEditDialog::Location loc;
-            if (ResolveStartupLocation(g_startupEntries[row], loc)) {
-                if (StartupEditDialog::ShowEdit(hwnd, loc, g_startupEntries[row].valueName))
-                    DoRefresh();
-            }
-            else {
-                MessageBoxW(hwnd, L"Этот источник нельзя редактировать.", L"Инфо", MB_OK);
-            }
+    else if (tab == SUBTAB_DRIVERS) {
+        int row = GetDriverRowAt(fx, fy, contentArea);
+        if (row >= 0 && row < (int)g_drivers.size()) {
+            g_selectedDriverIndex = row;
+            LoadDriverSignature(row);
+            if (ServiceEditDialog::ShowEdit(hwnd, g_drivers[row].serviceName, true))
+                DoRefresh();
             return true;
         }
     }

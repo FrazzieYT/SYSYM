@@ -169,20 +169,15 @@
     <ClInclude Include="utils\common\logging.h" />
     <ClInclude Include="utils\common\string_utils.h" />
     <ClInclude Include="utils\file_system\file_explorer.h" />
-    <ClInclude Include="utils\file_system\system_cleanup.h" />
     <ClInclude Include="utils\file_system\text_file.h" />
     <ClInclude Include="utils\history\system_monitor.h" />
     <ClInclude Include="utils\net_utils.h" />
-    <ClInclude Include="utils\process\dll_injector.h" />
-    <ClInclude Include="utils\process\process_manager.h" />
+    <ClInclude Include="utils\process\offline_service_manager.h" />
     <ClInclude Include="utils\process\service_manager.h" />
     <ClInclude Include="utils\registry\registry_editor.h" />
     <ClInclude Include="utils\registry\startup_registry.h" />
     <ClInclude Include="utils\startup\service_edit_dialog.h" />
     <ClInclude Include="utils\startup\startup_edit_dialog.h" />
-    <ClInclude Include="utils\startup\startup_extensions.h" />
-    <ClInclude Include="utils\startup\startup_folders.h" />
-    <ClInclude Include="utils\startup\startup_system.h" />
     <ClInclude Include="utils\unlock\unlock_tools.h" />
   </ItemGroup>
   <ItemGroup>
@@ -202,19 +197,14 @@
     <ClCompile Include="ui\widgets.cpp" />
     <ClCompile Include="utils\accounts\account_manager.cpp" />
     <ClCompile Include="utils\file_system\file_explorer.cpp" />
-    <ClCompile Include="utils\file_system\system_cleanup.cpp" />
     <ClCompile Include="utils\file_system\text_file.cpp" />
     <ClCompile Include="utils\history\system_monitor.cpp" />
-    <ClCompile Include="utils\process\dll_injector.cpp" />
-    <ClCompile Include="utils\process\process_manager.cpp" />
+    <ClCompile Include="utils\process\offline_service_manager.cpp" />
     <ClCompile Include="utils\process\service_manager.cpp" />
     <ClCompile Include="utils\registry\registry_editor.cpp" />
     <ClCompile Include="utils\registry\startup_registry.cpp" />
     <ClCompile Include="utils\startup\service_edit_dialog.cpp" />
     <ClCompile Include="utils\startup\startup_edit_dialog.cpp" />
-    <ClCompile Include="utils\startup\startup_extensions.cpp" />
-    <ClCompile Include="utils\startup\startup_folders.cpp" />
-    <ClCompile Include="utils\startup\startup_system.cpp" />
     <ClCompile Include="utils\unlock\unlock_tools.cpp" />
   </ItemGroup>
   <ItemGroup>

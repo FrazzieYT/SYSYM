@@ -14,15 +14,17 @@ static bool g_defaultsApplied = false;
 
 // Положение панели вкладок: 0=Верх, 1=Лево, 2=Право, 3=Низ
 static int g_settingsTabPosition = 1;
-static RectF g_settingsTabPosRects[4];
 
-// Диски для слежки — ОДИН выбранный
-static std::vector<std::wstring> g_settingsDrives;
+// Диск: -1 = "Все", >=0 = индекс в g_settingsDrives
 static int g_settingsSelectedDrive = -1;
-static std::vector<RectF> g_settingsDrivesRects;
+static std::vector<std::wstring> g_settingsDrives;
+static std::vector<std::wstring> g_settingsDriveDisplayNames;
 static bool g_settingsDrivesInitialized = false;
 
-static std::vector<std::wstring> g_settingsDriveDisplayNames;
+// Прямоугольники для кликов
+static RectF g_settingsAllDrivesRect;            // пункт "Все"
+static std::vector<RectF> g_settingsDriveRects; // диски C:\, D:\, ...
+static RectF g_settingsTabPosRects[4];         // Верх/Лево/Право/Низ
 
 // ===== Утилиты =====
 static bool SettingsHitRect(const RectF& rect, float x, float y) {
@@ -83,11 +85,15 @@ static void EnsureDrivesInitialized() {
     bool inRecovery = IsRecoveryEnv();
 
     wchar_t sysDir[MAX_PATH] = {};
-    GetWindowsDirectoryW(sysDir, MAX_PATH);
+    (void)GetWindowsDirectoryW(sysDir, MAX_PATH);
     std::wstring sysDrive;
     if (sysDir[0] != 0) { sysDrive += sysDir[0]; sysDrive += L":\\"; }
 
-    struct Entry { std::wstring root; std::wstring display; bool hasWindows; };
+    struct Entry {
+        std::wstring root;
+        std::wstring display;
+        bool hasWindows = false;
+    };
     std::vector<Entry> entries;
 
     for (const wchar_t* p = buffer; *p; p += wcslen(p) + 1) {
@@ -98,9 +104,9 @@ static void EnsureDrivesInitialized() {
         bool hasWin = DriveHasWindows(drive);
         bool isSysDrive = (!sysDrive.empty() && drive == sysDrive);
 
-        // В recovery: пропускаем X: (RAM-диск WinRE) и всё, где нет Windows
+        // В recovery: пропускаем X, и всё, где нет Windows
         if (inRecovery) {
-            if (isSysDrive) continue;         // X:
+            if (isSysDrive) continue;
             if (!hasWin) continue;
         }
 
@@ -108,7 +114,7 @@ static void EnsureDrivesInitialized() {
         e.root = drive;
         e.hasWindows = hasWin;
 
-        std::wstring disp = drive.substr(0, 2);  // "C:"
+        std::wstring disp = drive.substr(0, 2);  // C:
         if (!inRecovery && isSysDrive) {
             disp += L" (система)";
         }
@@ -124,7 +130,7 @@ static void EnsureDrivesInitialized() {
         entries.push_back(e);
     }
 
-    // Fallback: в recovery ничего не нашли — показываем все fixed кроме X:
+    // Fallback: в recovery ничего не нашли, показываем все fixed кроме X
     if (entries.empty() && inRecovery) {
         for (const wchar_t* p = buffer; *p; p += wcslen(p) + 1) {
             std::wstring drive = p;
@@ -143,35 +149,21 @@ static void EnsureDrivesInitialized() {
         g_settingsDriveDisplayNames.push_back(e.display);
     }
 
-    // Выбор по умолчанию
-    if (inRecovery) {
-        // В среде восстановления — всегда приоритет C:
-        for (size_t i = 0; i < entries.size(); ++i) {
-            if (_wcsicmp(entries[i].root.c_str(), L"C:\\") == 0) {
-                g_settingsSelectedDrive = (int)i;
-                break;
-            }
-        }
-        // Если C: не найден — первый, где есть Windows
-        if (g_settingsSelectedDrive < 0) {
-            for (size_t i = 0; i < entries.size(); ++i) {
-                if (entries[i].hasWindows) {
-                    g_settingsSelectedDrive = (int)i;
-                    break;
-                }
-            }
+    // Дефолт: всегда C:, если он есть. Иначе системный / первый с Windows / первый.
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (_wcsicmp(entries[i].root.c_str(), L"C:\\") == 0) {
+            g_settingsSelectedDrive = (int)i;
+            break;
         }
     }
-    else {
-        // В живой системе — системный диск Windows
+    if (g_settingsSelectedDrive < 0) {
         for (size_t i = 0; i < entries.size(); ++i) {
-            if (entries[i].root == sysDrive) {
+            if (entries[i].root == sysDrive || entries[i].hasWindows) {
                 g_settingsSelectedDrive = (int)i;
                 break;
             }
         }
     }
-    // Фолбэк — первый доступный
     if (g_settingsSelectedDrive < 0 && !g_settingsDrives.empty())
         g_settingsSelectedDrive = 0;
 
@@ -184,15 +176,20 @@ int GetSettingsTabPosition() {
 }
 
 bool IsDriveMonitored(const std::wstring& drive) {
-    if (g_settingsSelectedDrive < 0 ||
-        g_settingsSelectedDrive >= (int)g_settingsDrives.size()) return false;
+    EnsureDrivesInitialized();
+    if (g_settingsSelectedDrive < 0) return true;   // Все
+    if (g_settingsSelectedDrive >= (int)g_settingsDrives.size()) return false;
     return g_settingsDrives[g_settingsSelectedDrive] == drive;
 }
 
 std::vector<std::wstring> GetMonitoredDrives() {
+    EnsureDrivesInitialized();
     std::vector<std::wstring> result;
-    if (g_settingsSelectedDrive >= 0 &&
-        g_settingsSelectedDrive < (int)g_settingsDrives.size()) {
+    if (g_settingsSelectedDrive < 0) {
+        // "Все" отдаём весь список
+        result = g_settingsDrives;
+    }
+    else if (g_settingsSelectedDrive < (int)g_settingsDrives.size()) {
         result.push_back(g_settingsDrives[g_settingsSelectedDrive]);
     }
     return result;
@@ -203,6 +200,26 @@ void ApplyDefaultSettings() {
     ApplyAlwaysOnTop();
     EnsureDrivesInitialized();
     g_defaultsApplied = true;
+}
+
+// === Рисование одного пункта списка ===
+static void DrawListItem(
+    Graphics& g, const RectF& r, const wchar_t* label,
+    bool active, Font& font,
+    SolidBrush& textBrush, SolidBrush& mutedBrush,
+    SolidBrush& controlBg, SolidBrush& activeBg,
+    Pen& borderPen)
+{
+    SolidBrush& bg = active ? activeBg : controlBg;
+    g.FillRectangle(&bg, r);
+    g.DrawRectangle(&borderPen, r);
+
+    StringFormat fmt;
+    fmt.SetAlignment(StringAlignmentNear);
+    fmt.SetLineAlignment(StringAlignmentCenter);
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    RectF txt(r.X + 10.0f, r.Y, r.Width - 14.0f, r.Height);
+    g.DrawString(label, -1, &font, txt, &fmt, active ? &textBrush : &mutedBrush);
 }
 
 // ===== Отрисовка =====
@@ -236,22 +253,17 @@ void DrawSettingsContent(Graphics& g, const RectF& contentArea, Font& contentFon
     rightFormat.SetLineAlignment(StringAlignmentCenter);
     rightFormat.SetTrimming(StringTrimmingEllipsisCharacter);
 
-    StringFormat centerFormat;
-    centerFormat.SetAlignment(StringAlignmentCenter);
-    centerFormat.SetLineAlignment(StringAlignmentCenter);
-
     float x = contentArea.X + 16.0f;
     float top = contentArea.Y + 16.0f;
+    float titleW = contentArea.Width - 32.0f;
 
-    RectF titleRect(x, top, contentArea.Width - 32.0f, 30.0f);
+    RectF titleRect(x, top, titleW, 30.0f);
     g.DrawString(L"Настройки", -1, &titleFont, titleRect, &leftFormat, &textBrush);
 
     // ===== Строка 1: Поверх всех окон =====
-    float rowWidth = 380.0f;
-    if (rowWidth > contentArea.Width - 32.0f) rowWidth = contentArea.Width - 32.0f;
-    if (rowWidth < 240.0f) rowWidth = 240.0f;
+    const float rowW = 380.0f;
 
-    RectF alwaysOnTopRow(x, top + 44.0f, rowWidth, 34.0f);
+    RectF alwaysOnTopRow(x, top + 44.0f, rowW, 34.0f);
     g_settingsAlwaysOnTopRect = alwaysOnTopRow;
 
     g.FillRectangle(&controlBg, alwaysOnTopRow);
@@ -276,73 +288,63 @@ void DrawSettingsContent(Graphics& g, const RectF& contentArea, Font& contentFon
     g.DrawString(g_settingsAlwaysOnTop ? L"ВКЛ" : L"ВЫКЛ", -1, &itemFont,
         stateRect, &rightFormat, g_settingsAlwaysOnTop ? &textBrush : &mutedBrush);
 
-    // ===== Строка 2: Положение панели вкладок =====
-    float row2Y = alwaysOnTopRow.Y + alwaysOnTopRow.Height + 14.0f;
+    // === Две колонки: Диск | Панель вкладок ===
+    float colsTop = alwaysOnTopRow.Y + alwaysOnTopRow.Height + 18.0f;
+    const float colGap = 24.0f;
+    const float colW = 220.0f;
 
-    RectF tabPosLabel(x, row2Y, 180.0f, 26.0f);
-    g.DrawString(L"Панель вкладок:", -1, &itemFont, tabPosLabel, &leftFormat, &textBrush);
+    float leftColX = x;
+    float rightColX = x + colW + colGap;
 
-    const wchar_t* tabPosNames[4] = { L"Верх", L"Лево", L"Право", L"Низ" };
-    float pillW = 74.0f;
-    float pillH = 26.0f;
-    float pillX = x + 180.0f;
-    float pillY = row2Y;
+    const float itemH = 28.0f;
+    const float itemGap = 4.0f;
 
-    for (int i = 0; i < 4; ++i) {
-        RectF pill(pillX, pillY, pillW, pillH);
-        g_settingsTabPosRects[i] = pill;
+    // Левая колонка: Диск
+    RectF drivesTitle(leftColX, colsTop, colW, 24.0f);
+    g.DrawString(L"Диск:", -1, &itemFont, drivesTitle, &leftFormat, &textBrush);
 
-        bool active = (g_settingsTabPosition == i);
-        SolidBrush pillBg(active ? COLOR_TAB_ACTIVE : COLOR_TAB_BG);
-        g.FillRectangle(&pillBg, pill);
-        g.DrawRectangle(&borderPen, pill);
+    float itemY = colsTop + 28.0f;
 
-        g.DrawString(tabPosNames[i], -1, &smallFont, pill, &centerFormat,
-            active ? &textBrush : &mutedBrush);
+    // "Все"
+    g_settingsAllDrivesRect = RectF(leftColX, itemY, colW, itemH);
+    bool allActive = (g_settingsSelectedDrive < 0);
+    DrawListItem(g, g_settingsAllDrivesRect, L"Все", allActive, itemFont,
+        textBrush, mutedBrush, controlBg, activeBg, borderPen);
+    itemY += itemH + itemGap;
 
-        pillX += pillW + 6.0f;
-    }
-
-    // ===== Строка 3: Диск =====
-    float row3Y = row2Y + pillH + 20.0f;
-
-    RectF drivesLabel(x, row3Y, 220.0f, 26.0f);
-    g.DrawString(L"Диск:", -1, &itemFont, drivesLabel, &leftFormat, &textBrush);
-
-    EnsureDrivesInitialized();
-
-    float driveX = x;
-    float driveY = row3Y + 32.0f;
-    float driveW = 100.0f;
-    float driveH = 32.0f;
-    float driveGapX = 8.0f;
-    float driveGapY = 8.0f;
-
-    g_settingsDrivesRects.clear();
-    g_settingsDrivesRects.resize(g_settingsDrives.size());
-
+    // Пункты дисков
+    g_settingsDriveRects.clear();
+    g_settingsDriveRects.resize(g_settingsDrives.size());
     for (size_t i = 0; i < g_settingsDrives.size(); ++i) {
-        if (driveX + driveW > x + rowWidth) {
-            driveX = x;
-            driveY += driveH + driveGapY;
-        }
-        RectF chip(driveX, driveY, driveW, driveH);
-        g_settingsDrivesRects[i] = chip;
+        RectF r(leftColX, itemY, colW, itemH);
+        g_settingsDriveRects[i] = r;
 
         bool active = ((int)i == g_settingsSelectedDrive);
-        SolidBrush chipBg(active ? COLOR_TAB_ACTIVE : COLOR_TAB_BG);
-        g.FillRectangle(&chipBg, chip);
-        g.DrawRectangle(&borderPen, chip);
-
-        RectF txt(chip.X, chip.Y, chip.Width, chip.Height);
-        const std::wstring& displayName =
+        const std::wstring& disp =
             (i < g_settingsDriveDisplayNames.size())
             ? g_settingsDriveDisplayNames[i]
             : g_settingsDrives[i];
-        g.DrawString(displayName.c_str(), -1, &itemFont, txt, &centerFormat,
-            active ? &textBrush : &mutedBrush);
+        DrawListItem(g, r, disp.c_str(), active, itemFont,
+            textBrush, mutedBrush, controlBg, activeBg, borderPen);
 
-        driveX += driveW + driveGapX;
+        itemY += itemH + itemGap;
+    }
+
+    // ---- Правая колонка: Панель вкладок ----
+    RectF tabPosTitle(rightColX, colsTop, colW, 24.0f);
+    g.DrawString(L"Панель вкладок:", -1, &itemFont, tabPosTitle, &leftFormat, &textBrush);
+
+    const wchar_t* tabNames[4] = { L"Верх", L"Лево", L"Право", L"Низ" };
+    float tabY = colsTop + 28.0f;
+    for (int i = 0; i < 4; ++i) {
+        RectF r(rightColX, tabY, colW, itemH);
+        g_settingsTabPosRects[i] = r;
+
+        bool active = (g_settingsTabPosition == i);
+        DrawListItem(g, r, tabNames[i], active, itemFont,
+            textBrush, mutedBrush, controlBg, activeBg, borderPen);
+
+        tabY += itemH + itemGap;
     }
 }
 
@@ -360,19 +362,26 @@ bool OnSettingsClick(int x, int y, const RectF& contentArea) {
         return true;
     }
 
-    // Положение панели вкладок
-    for (int i = 0; i < 4; ++i) {
-        if (SettingsHitRect(g_settingsTabPosRects[i], fx, fy)) {
-            g_settingsTabPosition = i;
+    // Диск: "Все"
+    if (SettingsHitRect(g_settingsAllDrivesRect, fx, fy)) {
+        g_settingsSelectedDrive = -1;
+        InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
+        return true;
+    }
+
+    // Диск: конкретный
+    for (size_t i = 0; i < g_settingsDriveRects.size(); ++i) {
+        if (SettingsHitRect(g_settingsDriveRects[i], fx, fy)) {
+            g_settingsSelectedDrive = (int)i;
             InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
             return true;
         }
     }
 
-    // Диски — одиночный выбор
-    for (size_t i = 0; i < g_settingsDrivesRects.size(); ++i) {
-        if (SettingsHitRect(g_settingsDrivesRects[i], fx, fy)) {
-            g_settingsSelectedDrive = (int)i;
+    // Панель вкладок
+    for (int i = 0; i < 4; ++i) {
+        if (SettingsHitRect(g_settingsTabPosRects[i], fx, fy)) {
+            g_settingsTabPosition = i;
             InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
             return true;
         }

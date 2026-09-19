@@ -13,6 +13,7 @@ namespace StartupEditDialog {
 
     struct State {
         Location loc;
+        std::vector<Location> customLocations;
         std::wstring valueName;
         std::wstring command;
         bool isCreate = false;
@@ -28,16 +29,18 @@ namespace StartupEditDialog {
 
     static std::vector<Location> GetStandardLocations() {
         return {
-            { HKEY_CURRENT_USER,  kRun,     L"HKCU \\ Run" },
-            { HKEY_CURRENT_USER,  kRunOnce, L"HKCU \\ RunOnce" },
-            { HKEY_LOCAL_MACHINE, kRun,     L"HKLM \\ Run" },
-            { HKEY_LOCAL_MACHINE, kRunOnce, L"HKLM \\ RunOnce" },
+            { HKEY_CURRENT_USER,  kRun,     L"HKCU \\ Run",           KEY_WOW64_64KEY },
+            { HKEY_CURRENT_USER,  kRunOnce, L"HKCU \\ RunOnce",       KEY_WOW64_64KEY },
+            { HKEY_LOCAL_MACHINE, kRun,     L"HKLM \\ Run",           KEY_WOW64_64KEY },
+            { HKEY_LOCAL_MACHINE, kRunOnce, L"HKLM \\ RunOnce",       KEY_WOW64_64KEY },
+            { HKEY_CURRENT_USER,  kRun,     L"HKCU \\ Run (32)",      KEY_WOW64_32KEY },
+            { HKEY_LOCAL_MACHINE, kRun,     L"HKLM \\ Run (32)",      KEY_WOW64_32KEY },
         };
     }
 
     static bool ReadCommand(const Location& loc, const std::wstring& valueName, std::wstring& out) {
         HKEY hKey = nullptr;
-        if (RegOpenKeyExW(loc.root, loc.subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        if (RegOpenKeyExW(loc.root, loc.subKey.c_str(), 0, KEY_READ | loc.view, &hKey) != ERROR_SUCCESS)
             return false;
         wchar_t buf[4096] = {};
         DWORD sz = sizeof(buf);
@@ -52,8 +55,18 @@ namespace StartupEditDialog {
     static bool WriteCommand(const Location& loc, const std::wstring& valueName, const std::wstring& command) {
         HKEY hKey = nullptr;
         if (RegCreateKeyExW(loc.root, loc.subKey.c_str(), 0, nullptr, 0,
-            KEY_SET_VALUE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) return false;
-        LONG r = RegSetValueExW(hKey, valueName.c_str(), 0, REG_SZ,
+            KEY_SET_VALUE | loc.view, nullptr, &hKey, nullptr) != ERROR_SUCCESS) return false;
+
+        // Сохраняем тип существующего значения
+        DWORD existingType = REG_SZ;
+        DWORD typeSize = sizeof(existingType);
+        if (RegQueryValueExW(hKey, valueName.c_str(), nullptr,
+            &existingType, nullptr, nullptr) != ERROR_SUCCESS ||
+            (existingType != REG_SZ && existingType != REG_EXPAND_SZ)) {
+            existingType = REG_SZ;
+        }
+
+        LONG r = RegSetValueExW(hKey, valueName.c_str(), 0, existingType,
             (const BYTE*)command.c_str(),
             (DWORD)((command.size() + 1) * sizeof(wchar_t)));
         RegCloseKey(hKey);
@@ -115,7 +128,9 @@ namespace StartupEditDialog {
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                     editX, y, editW, 200, hWnd, (HMENU)103, hInst, nullptr);
                 SendMessageW(st->hLocation, WM_SETFONT, (WPARAM)font, TRUE);
-                auto locs = GetStandardLocations();
+                const auto& locs = st->customLocations.empty()
+                    ? GetStandardLocations()
+                    : st->customLocations;
                 for (const auto& L : locs)
                     SendMessageW(st->hLocation, CB_ADDSTRING, 0, (LPARAM)L.label.c_str());
                 SendMessageW(st->hLocation, CB_SETCURSEL, 0, 0);
@@ -173,7 +188,9 @@ namespace StartupEditDialog {
                 Location loc = st->loc;
                 if (st->isCreate && st->hLocation) {
                     int idx = (int)SendMessageW(st->hLocation, CB_GETCURSEL, 0, 0);
-                    auto locs = GetStandardLocations();
+                    const auto& locs = st->customLocations.empty()
+                        ? GetStandardLocations()
+                        : st->customLocations;
                     if (idx >= 0 && idx < (int)locs.size()) loc = locs[idx];
                 }
 
@@ -280,6 +297,15 @@ namespace StartupEditDialog {
     bool ShowCreate(HWND parent) {
         State st{};
         st.isCreate = true;
+        return RunDialog(parent, st, L"Создание записи автозагрузки");
+    }
+
+    bool ShowCreate(HWND parent, const std::vector<Location>& locations) {
+        State st{};
+        st.isCreate = true;
+        st.customLocations = locations;
+        if (!st.customLocations.empty())
+            st.loc = st.customLocations[0];
         return RunDialog(parent, st, L"Создание записи автозагрузки");
     }
 }

@@ -13,6 +13,7 @@ namespace ServiceEditDialog {
     struct State {
         Config cfg;
         bool isCreate = false;
+        bool isDriver = false;
         HWND hName = nullptr;
         HWND hDisplayName = nullptr;
         HWND hPath = nullptr;
@@ -36,6 +37,7 @@ namespace ServiceEditDialog {
             if (q) {
                 if (QueryServiceConfigW(svc, q, need, &need)) {
                     cfg.name = name;
+                    cfg.serviceType = q->dwServiceType;
                     if (q->lpDisplayName) cfg.displayName = q->lpDisplayName;
                     if (q->lpBinaryPathName) cfg.binaryPath = q->lpBinaryPathName;
                     if (q->lpServiceStartName) cfg.account = q->lpServiceStartName;
@@ -72,7 +74,8 @@ namespace ServiceEditDialog {
         if (isCreate) {
             SC_HANDLE svc = CreateServiceW(
                 scm, cfg.name.c_str(), cfg.displayName.c_str(),
-                SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_ALL_ACCESS,
+                cfg.serviceType,        // SERVICE_WIN32_OWN_PROCESS
                 cfg.startType, SERVICE_ERROR_NORMAL,
                 cfg.binaryPath.c_str(),
                 nullptr, nullptr, nullptr,
@@ -201,9 +204,22 @@ namespace ServiceEditDialog {
             SendMessageW(st->hStartType, CB_SETCURSEL, sel, 0);
             y += editH + gap;
 
-            label(L"Учётная запись:", y);
-            st->hAccount = edit(st->cfg.account, y);
-            y += editH + gap;
+            if (!st->isDriver) {
+                label(L"Учётная запись:", y);
+                st->hAccount = edit(st->cfg.account, y);
+                y += editH + gap;
+            }
+            else {
+                label(L"Тип:", y);
+                HWND h = CreateWindowExW(0, L"STATIC",
+                    (st->cfg.serviceType == SERVICE_FILE_SYSTEM_DRIVER)
+                    ? L"File System Driver"
+                    : L"Kernel Driver",
+                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                    editX, y + 3, editW, editH, hWnd, nullptr, hInst, nullptr);
+                SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
+                y += editH + gap;
+            }
 
             label(L"Описание:", y);
             y += 20;
@@ -234,7 +250,7 @@ namespace ServiceEditDialog {
                 st->cfg.name = GetText(st->hName);
                 st->cfg.displayName = GetText(st->hDisplayName);
                 st->cfg.binaryPath = GetText(st->hPath);
-                st->cfg.account = GetText(st->hAccount);
+                if (st->hAccount) st->cfg.account = GetText(st->hAccount);
                 st->cfg.description = GetText(st->hDescription);
 
                 int idx = (int)SendMessageW(st->hStartType, CB_GETCURSEL, 0, 0);
@@ -340,20 +356,23 @@ namespace ServiceEditDialog {
         return state.ok;
     }
 
-    bool ShowEdit(HWND parent, const std::wstring& serviceName) {
+    bool ShowEdit(HWND parent, const std::wstring& serviceName, bool isDriver) {
         State st{};
         st.isCreate = false;
+        st.isDriver = isDriver;
         if (!ReadConfig(serviceName, st.cfg)) {
-            MessageBoxW(parent, L"Не удалось прочитать конфигурацию службы.",
+            MessageBoxW(parent, L"Не удалось прочитать конфигурацию.",
                 L"Ошибка", MB_OK | MB_ICONERROR);
             return false;
         }
-        return RunDialog(parent, st, L"Изменение службы");
+        const wchar_t* title = isDriver ? L"Изменение драйвера" : L"Изменение службы";
+        return RunDialog(parent, st, title);
     }
 
     bool ShowCreate(HWND parent) {
         State st{};
         st.isCreate = true;
+        st.isDriver = false;
         st.cfg.startType = SERVICE_DEMAND_START;
         st.cfg.account = L"LocalSystem";
         return RunDialog(parent, st, L"Создание службы");

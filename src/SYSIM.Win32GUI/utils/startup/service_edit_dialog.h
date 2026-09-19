@@ -11,8 +11,9 @@ namespace ServiceEditDialog {
         std::wstring description;
         std::wstring account;
         DWORD startType = SERVICE_DEMAND_START;
+        DWORD serviceType = SERVICE_WIN32_OWN_PROCESS;
     };
 
-    bool ShowEdit(HWND parent, const std::wstring& serviceName);
+    bool ShowEdit(HWND parent, const std::wstring& serviceName, bool isDriver = false);
     bool ShowCreate(HWND parent);
 }

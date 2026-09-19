@@ -3,6 +3,7 @@
 #include "core/app.h"
 #include "ui/widgets.h"
 #include "notepad.h"
+#include "../WinCtrl/include/Scanner.h"
 #include "utils/file_system/text_file.h"
 #include "utils/file_system/file_explorer.h"
 #include <string>
@@ -39,6 +40,7 @@ static const float EX_ADDR_TOP = 4.0f;
 static const float EX_ADDR_HEIGHT = 22.0f;
 static const float EX_TOP_MARGIN = 30.0f;
 static const float EX_ROW_HEIGHT = 20.0f;
+static const float EX_SIG_WIDTH = 40.0f;
 
 // Custom column widths
 static float g_explorerNameColumnRatio = 0.55f;
@@ -525,7 +527,7 @@ static void OpenSelectedItemInNotepad() {
     if (!IsNormalSelectedIndex(index)) return;
     FileExplorer::FileItem& item = g_explorerItems[index];
     if (item.isDirectory) return;
-    if (g_useVerticalLayout) g_activeMainTab = -2; else g_activeTab = -2;
+    g_activeMainTab = 7;
     Notepad::OpenFile(item.fullPath);
     InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
 }
@@ -645,6 +647,28 @@ static bool ShowExplorerContextMenu(int x, int y) {
     return true;
 }
 
+static void LoadExplorerSig(int index) {
+    if (index < 0 || index >= (int)g_explorerItems.size()) return;
+    auto& item = g_explorerItems[index];
+    if (item.isDirectory) return;
+    if (item.sigChecked) return;
+    if (item.fullPath.empty()) {
+        item.sigChecked = true;
+        return;
+    }
+
+    std::wstring signer;
+    bool isMs = false, isTrusted = false;
+    auto st = WinCtrl::Scanner::VerifySignature(
+        item.fullPath, &signer, nullptr, &isMs, &isTrusted, true);
+
+    item.signer = signer;
+    item.sigMicrosoft = isMs;
+    item.sigValid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Valid);
+    item.sigInvalid = (st == WinCtrl::Scanner::ScanResult::SigStatus::Invalid);
+    item.sigChecked = true;
+}
+
 // === Drawing ===
 void DrawExplorerContent(Graphics& g, const RectF& contentArea, Font& contentFont) {
     (void)contentFont;
@@ -729,8 +753,10 @@ void DrawExplorerContent(Graphics& g, const RectF& contentArea, Font& contentFon
     RectF listRect = GetListRect(contentArea);
     float nameColWidth = 0.0f, sizeColWidth = 0.0f;
     GetExplorerColumnWidths(listRect, nameColWidth, sizeColWidth);
-    float dateColWidth = listRect.Width - nameColWidth - sizeColWidth - SCROLLBAR_W - 2.0f;
+    float afterSize = listRect.Width - nameColWidth - sizeColWidth - SCROLLBAR_W - 2.0f;
+    float dateColWidth = afterSize - EX_SIG_WIDTH;
     if (dateColWidth < 0.0f) dateColWidth = 0.0f;
+    float sigColWidth = EX_SIG_WIDTH;
 
     g.FillRectangle(&controlBg, listRect);
     g.DrawRectangle(&borderPen, listRect);
@@ -743,6 +769,10 @@ void DrawExplorerContent(Graphics& g, const RectF& contentArea, Font& contentFon
         RectF(listRect.X + nameColWidth + 6.0f, headerY, PositiveWidth(sizeColWidth - 12.0f), 26.0f), &headerFormat, &textBrush);
     g.DrawString(L"Дата", -1, &headFont,
         RectF(listRect.X + nameColWidth + sizeColWidth + 6.0f, headerY, PositiveWidth(dateColWidth - 12.0f), 26.0f), &headerFormat, &textBrush);
+    g.DrawString(L"Sig", -1, &headFont,
+        RectF(listRect.X + nameColWidth + sizeColWidth + dateColWidth + 6.0f,
+            headerY, PositiveWidth(sigColWidth - 12.0f), 26.0f),
+        &headerFormat, &textBrush);
 
     // Разделитель заголовка
     Pen headerLine(Color(60, 60, 60), 1.0f);
@@ -764,6 +794,10 @@ void DrawExplorerContent(Graphics& g, const RectF& contentArea, Font& contentFon
     // Область отсечения для списка (чтобы строки не залезали на заголовок)
     RectF clipRect(listRect.X, listRect.Y + 29.0f, listRect.Width - SCROLLBAR_W - 1.0f, visibleH + 1.0f);
     g.SetClip(clipRect);
+
+    SolidBrush sigValid(Color(255, 100, 220, 100));
+    SolidBrush sigUnsigned(Color(255, 160, 160, 160));
+    SolidBrush sigInvalid(Color(255, 240, 80, 80));
 
     SolidBrush selectedBg(COLOR_TAB_ACTIVE);
     for (int i = startRow; i < endRow; ++i) {
@@ -810,6 +844,33 @@ void DrawExplorerContent(Graphics& g, const RectF& contentArea, Font& contentFon
         wchar_t dateBuf[64]{};
         swprintf_s(dateBuf, L"%02d.%02d.%04d %02d:%02d", st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
         RectF dateCell(listRect.X + nameColWidth + sizeColWidth + 6.0f, y, PositiveWidth(dateColWidth - 12.0f), EX_ROW_HEIGHT);
+
+        RectF sigCell(
+            listRect.X + nameColWidth + sizeColWidth + dateColWidth,
+            y, sigColWidth, EX_ROW_HEIGHT);
+
+        if (item.isDirectory) {
+            StringFormat cf;
+            cf.SetAlignment(StringAlignmentCenter);
+            cf.SetLineAlignment(StringAlignmentCenter);
+            g.DrawString(L"—", -1, &itemFont, sigCell, &cf, &mutedBrush);
+        }
+        else if (!item.sigChecked) {
+            SolidBrush dot(Color(255, 90, 90, 90));
+            g.FillEllipse(&dot, RectF(sigCell.X + 14.0f, y + 10.0f, 5.0f, 5.0f));
+        }
+        else {
+            SolidBrush* b = &sigUnsigned;
+            const wchar_t* sym = L"—";
+            if (item.sigValid) { b = &sigValid;    sym = L"✓"; }
+            else if (item.sigInvalid) { b = &sigInvalid;  sym = L"✗"; }
+
+            StringFormat cf;
+            cf.SetAlignment(StringAlignmentCenter);
+            cf.SetLineAlignment(StringAlignmentCenter);
+            g.DrawString(sym, -1, &itemFont, sigCell, &cf, b);
+        }
+
         g.DrawString(dateBuf, -1, &itemFont, dateCell, &cellFormat, &mutedBrush);
     }
     g.ResetClip();
@@ -878,6 +939,7 @@ bool OnExplorerClick(int x, int y, const RectF& contentArea) {
         return true;
     }
     g_explorerSelectedIndex = row;
+    LoadExplorerSig(row);
     RequestExplorerRedraw();
     return true;
 }
@@ -889,6 +951,8 @@ bool OnExplorerRightClick(int x, int y, const RectF& contentArea) {
     if (!HitTestRect(GetListRect(contentArea), fx, fy)) return false;
     int row = GetExplorerRowAt(x, y, contentArea);
     g_explorerSelectedIndex = IsNormalSelectedIndex(row) ? row : -1;
+    if (g_explorerSelectedIndex >= 0)
+        LoadExplorerSig(g_explorerSelectedIndex);
     RequestExplorerRedraw();
     return ShowExplorerContextMenu(x, y);
 }

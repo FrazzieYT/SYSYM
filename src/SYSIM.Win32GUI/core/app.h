@@ -10,10 +10,15 @@ public:
     HINSTANCE GetInstance() const { return m_hInst; }
     static App* Instance() { return s_pInstance; }
 
-    // System Tray
+    // Системный трей
     void MinimizeToTray();
     void RestoreFromTray();
     void Quit();
+
+    // Ддвойная буферизация
+    void EnsureBackBuffer(int width, int height);
+    void ReleaseBackBuffer();
+    HDC GetBackBufferDC() const { return m_memDC; }
 
     static constexpr UINT WM_TRAYICON = WM_APP + 420;
 
@@ -22,4 +27,11 @@ private:
     HWND m_hWnd = nullptr;
     bool m_trayAdded = false;
     static App* s_pInstance;
+
+    // Back buffer
+    HDC m_memDC = nullptr;
+    HBITMAP m_memBitmap = nullptr;
+    HBITMAP m_oldBitmap = nullptr;
+    int m_memWidth = 0;
+    int m_memHeight = 0;
 };

@@ -108,20 +108,8 @@
     <ClInclude Include="utils\file_system\file_explorer.h">
       <Filter>Utils\file_system</Filter>
     </ClInclude>
-    <ClInclude Include="utils\file_system\system_cleanup.h">
-      <Filter>Utils\file_system</Filter>
-    </ClInclude>
     <ClInclude Include="utils\history\system_monitor.h">
       <Filter>Utils\history</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\startup\startup_extensions.h">
-      <Filter>Utils\startup</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\startup\startup_folders.h">
-      <Filter>Utils\startup</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\startup\startup_system.h">
-      <Filter>Utils\startup</Filter>
     </ClInclude>
     <ClInclude Include="utils\registry\registry_editor.h">
       <Filter>Utils\registry</Filter>
@@ -150,12 +138,6 @@
     <ClInclude Include="features\accounts.h">
       <Filter>Features</Filter>
     </ClInclude>
-    <ClInclude Include="utils\process\dll_injector.h">
-      <Filter>Utils\process</Filter>
-    </ClInclude>
-    <ClInclude Include="utils\process\process_manager.h">
-      <Filter>Utils\process</Filter>
-    </ClInclude>
     <ClInclude Include="utils\process\service_manager.h">
       <Filter>Utils\process</Filter>
     </ClInclude>
@@ -164,6 +146,9 @@
     </ClInclude>
     <ClInclude Include="utils\startup\startup_edit_dialog.h">
       <Filter>Utils\startup</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\process\offline_service_manager.h">
+      <Filter>Utils\process</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -200,20 +185,8 @@
     <ClCompile Include="utils\file_system\file_explorer.cpp">
       <Filter>Utils\file_system</Filter>
     </ClCompile>
-    <ClCompile Include="utils\file_system\system_cleanup.cpp">
-      <Filter>Utils\file_system</Filter>
-    </ClCompile>
     <ClCompile Include="utils\history\system_monitor.cpp">
       <Filter>Utils\history</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\startup\startup_extensions.cpp">
-      <Filter>Utils\startup</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\startup\startup_folders.cpp">
-      <Filter>Utils\startup</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\startup\startup_system.cpp">
-      <Filter>Utils\startup</Filter>
     </ClCompile>
     <ClCompile Include="utils\registry\registry_editor.cpp">
       <Filter>Utils\registry</Filter>
@@ -242,12 +215,6 @@
     <ClCompile Include="features\accounts.cpp">
       <Filter>Features</Filter>
     </ClCompile>
-    <ClCompile Include="utils\process\dll_injector.cpp">
-      <Filter>Utils\process</Filter>
-    </ClCompile>
-    <ClCompile Include="utils\process\process_manager.cpp">
-      <Filter>Utils\process</Filter>
-    </ClCompile>
     <ClCompile Include="utils\process\service_manager.cpp">
       <Filter>Utils\process</Filter>
     </ClCompile>
@@ -256,6 +223,9 @@
     </ClCompile>
     <ClCompile Include="utils\startup\startup_edit_dialog.cpp">
       <Filter>Utils\startup</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\process\offline_service_manager.cpp">
+      <Filter>Utils\process</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

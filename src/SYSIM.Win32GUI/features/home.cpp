@@ -4,14 +4,17 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <powrprof.h>
+#include <commdlg.h>
 #include <string>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 #ifndef SHTDN_REASON_MAJOR_OTHER
 #define SHTDN_REASON_MAJOR_OTHER 0x00000000
@@ -20,7 +23,7 @@
 #define SHTDN_REASON_MINOR_OTHER 0x00000000
 #endif
 
-// === Простая функция запуска ===
+// === Запуск ===
 static bool Launch(const std::wstring& path, bool asAdmin = false) {
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -29,27 +32,42 @@ static bool Launch(const std::wstring& path, bool asAdmin = false) {
             L"Ошибка", MB_OK | MB_ICONERROR);
         return false;
     }
-
     HINSTANCE result = ShellExecuteW(
         App::Instance()->GetHWND(),
         asAdmin ? L"runas" : L"open",
-        path.c_str(),
-        nullptr,
-        nullptr,
-        SW_SHOWNORMAL
-    );
-
+        path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(result) <= 32) {
         MessageBoxW(App::Instance()->GetHWND(),
-            L"Не удалось открыть файл.",
-            L"Ошибка", MB_OK | MB_ICONERROR);
+            L"Не удалось открыть файл.", L"Ошибка", MB_OK | MB_ICONERROR);
         return false;
     }
-
     return true;
 }
 
-// === Структура кнопки ===
+static bool RunCommand(const std::wstring& cmd) {
+    if (cmd.empty()) return false;
+    DWORD attrs = GetFileAttributesW(cmd.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        HINSTANCE r = ShellExecuteW(nullptr, L"open", cmd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return reinterpret_cast<INT_PTR>(r) > 32;
+    }
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", cmd.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(r) > 32) return true;
+
+    std::wstring fullCmd = L"cmd.exe /c \"" + cmd + L"\"";
+    STARTUPINFOW si{ sizeof(si) };
+    PROCESS_INFORMATION pi{};
+    std::wstring mutableCmd = fullCmd;
+    if (CreateProcessW(nullptr, &mutableCmd[0], nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    }
+    return false;
+}
+
+// === Кнопки ===
 struct HomeButton {
     RectF rect;
     std::wstring text;
@@ -57,7 +75,15 @@ struct HomeButton {
 
 static std::vector<HomeButton> g_homeButtons;
 
-// === Helper functions ===
+// === Inline Run ===
+static std::wstring g_runText;
+static bool g_runActive = false;
+static int  g_runCaretPos = 0;
+static RectF g_runRect;
+static RectF g_runButtonRect;
+static RectF g_runBrowseRect;
+
+// === Утилиты ===
 static void HomeRedraw() {
     InvalidateRect(App::Instance()->GetHWND(), nullptr, TRUE);
 }
@@ -67,12 +93,11 @@ static bool HomeHitRect(const RectF& rect, float x, float y) {
         y >= rect.Y && y < rect.Y + rect.Height;
 }
 
-// === Power / Exit ===
+// === Питание ===
 static bool HomeEnableShutdownPrivilege() {
     HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
         return false;
-    }
     TOKEN_PRIVILEGES privileges{};
     privileges.PrivilegeCount = 1;
     privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
@@ -105,13 +130,11 @@ static void HomeShutdownComputer() {
 static void HomeSleepComputer() {
     if (MessageBoxW(App::Instance()->GetHWND(), L"Перевести компьютер в спящий режим?",
         L"Спящий режим", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
-
     if (!HomeEnableShutdownPrivilege()) {
         MessageBoxW(App::Instance()->GetHWND(), L"Не удалось получить привилегию для сна.",
             L"Ошибка", MB_OK | MB_ICONERROR);
         return;
     }
-
     if (!SetSuspendState(FALSE, TRUE, FALSE)) {
         DWORD err = GetLastError();
         wchar_t msg[256];
@@ -126,184 +149,410 @@ static void HomeLogOff() {
     ExitWindowsEx(EWX_LOGOFF, 0);
 }
 
-// === Network ===
-static void HomeDisableNetwork() {
-    if (MessageBoxW(App::Instance()->GetHWND(), L"Попытаться отключить сетевые адаптеры?",
-        L"Отключение сети", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
-    Launch(L"C:\\Windows\\System32\\ncpa.cpl", false);
-}
-
-// === Recovery ===
-static void HomeOpenRecovery() {
-    Launch(L"C:\\Windows\\System32\\rstrui.exe", true);
-}
-
-// === Settings & Tools ===
-static void HomeOpenProgramSettings() {
-    g_activeMainTab = 6;
-    HomeRedraw();
-}
-
-static void HomeOpenUnlock() {
-    g_activeMainTab = 4;
-    HomeRedraw();
-}
+static void HomeOpenProgramSettings() { g_activeMainTab = 8; HomeRedraw(); }
+static void HomeOpenUnlock() { g_activeMainTab = 4; HomeRedraw(); }
 
 static void HomeShowHelp() {
     MessageBoxW(App::Instance()->GetHWND(),
         L"Главная страница\n\n"
-        L"Все запуски используют прямые пути.\n"
-        L"Если файл не найден — будет показано сообщение об ошибке.",
+        L"• Строка снизу — вводите команды, пути, URL-ы и жмите Enter\n"
+        L"• Свёрнутая клавиша Esc отменяет ввод\n"
+        L"• Кнопки запускают системные инструменты",
         L"Справка", MB_OK | MB_ICONINFORMATION);
 }
 
-// === Init buttons ===
+// === Run-строка ===
+bool IsHomeRunEditing() { return g_runActive; }
+
+void CancelHomeRunEdit() {
+    g_runActive = false;
+    g_runText.clear();
+    g_runCaretPos = 0;
+}
+
+static void FinishRunEdit(bool apply) {
+    if (apply && !g_runText.empty()) {
+        if (!RunCommand(g_runText)) {
+            MessageBoxW(App::Instance()->GetHWND(),
+                (L"Не удалось выполнить:\n\n" + g_runText).c_str(),
+                L"Ошибка", MB_OK | MB_ICONWARNING);
+        }
+    }
+    CancelHomeRunEdit();
+}
+
+bool OnHomeRunKey(UINT msg, WPARAM wParam, LPARAM lParam) {
+    (void)lParam;
+    if (!g_runActive) return false;
+
+    if (msg == WM_CHAR) {
+        wchar_t ch = (wchar_t)wParam;
+        if (ch == L'\b' || ch == L'\r' || ch == L'\x1b' || ch == L'\t') return true;
+        g_runText.insert(g_runText.begin() + g_runCaretPos, ch);
+        g_runCaretPos++;
+        HomeRedraw();
+        return true;
+    }
+    if (msg == WM_KEYDOWN) {
+        // Ctrl-комбинации
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl) {
+            switch (wParam) {
+            case 'A': case 'a':
+                g_runCaretPos = (int)g_runText.size();
+                HomeRedraw();
+                return true;
+
+            case 'C': case 'c':
+                if (!g_runText.empty()) {
+                    if (OpenClipboard(nullptr)) {
+                        EmptyClipboard();
+                        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (g_runText.size() + 1) * sizeof(wchar_t));
+                        if (h) {
+                            wchar_t* p = (wchar_t*)GlobalLock(h);
+                            if (p) {
+                                wcscpy_s(p, g_runText.size() + 1, g_runText.c_str());
+                                GlobalUnlock(h);
+                                SetClipboardData(CF_UNICODETEXT, h);
+                            }
+                        }
+                        CloseClipboard();
+                    }
+                }
+                return true;
+
+            case 'X': case 'x':
+                if (!g_runText.empty()) {
+                    if (OpenClipboard(nullptr)) {
+                        EmptyClipboard();
+                        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (g_runText.size() + 1) * sizeof(wchar_t));
+                        if (h) {
+                            wchar_t* p = (wchar_t*)GlobalLock(h);
+                            if (p) {
+                                wcscpy_s(p, g_runText.size() + 1, g_runText.c_str());
+                                GlobalUnlock(h);
+                                SetClipboardData(CF_UNICODETEXT, h);
+                            }
+                        }
+                        CloseClipboard();
+                    }
+                    g_runText.clear();
+                    g_runCaretPos = 0;
+                    HomeRedraw();
+                }
+                return true;
+
+            case 'V': case 'v':
+                if (OpenClipboard(nullptr)) {
+                    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                    if (h) {
+                        wchar_t* p = (wchar_t*)GlobalLock(h);
+                        if (p) {
+                            std::wstring paste = p;
+                            for (wchar_t& c : paste)
+                                if (c == L'\r' || c == L'\n') c = L' ';
+                            if (paste.size() > 2048) paste.resize(2048);
+
+                            g_runText.insert(g_runCaretPos, paste);
+                            g_runCaretPos += (int)paste.size();
+                            GlobalUnlock(h);
+                            HomeRedraw();
+                        }
+                    }
+                    CloseClipboard();
+                }
+                return true;
+            }
+            return true;
+        }
+        switch (wParam) {
+        case VK_RETURN: FinishRunEdit(true); HomeRedraw(); return true;
+        case VK_ESCAPE: FinishRunEdit(false); HomeRedraw(); return true;
+        case VK_BACK:
+            if (g_runCaretPos > 0) {
+                g_runText.erase(g_runCaretPos - 1, 1);
+                g_runCaretPos--;
+                HomeRedraw();
+            }
+            return true;
+        case VK_DELETE:
+            if (g_runCaretPos < (int)g_runText.size()) {
+                g_runText.erase(g_runCaretPos, 1);
+                HomeRedraw();
+            }
+            return true;
+        case VK_LEFT:
+            if (g_runCaretPos > 0) g_runCaretPos--;
+            HomeRedraw();
+            return true;
+        case VK_RIGHT:
+            if (g_runCaretPos < (int)g_runText.size()) g_runCaretPos++;
+            HomeRedraw();
+            return true;
+        case VK_HOME: g_runCaretPos = 0; HomeRedraw(); return true;
+        case VK_END: g_runCaretPos = (int)g_runText.size(); HomeRedraw(); return true;
+        default: return false;
+        }
+    }
+    return false;
+}
+
+// === Инициализация кнопок ===
 void InitHomeButtons() {
     g_homeButtons.clear();
 
-    // Power / Login
+    // Питание
     g_homeButtons.push_back({ RectF(), L"Перезагрузка" });
     g_homeButtons.push_back({ RectF(), L"Выключить" });
     g_homeButtons.push_back({ RectF(), L"Спящий режим" });
-    g_homeButtons.push_back({ RectF(), L"Выйти из системы" });
-    g_homeButtons.push_back({ RectF(), L"Отключить сеть" });
+    g_homeButtons.push_back({ RectF(), L"Выйти" });
+    g_homeButtons.push_back({ RectF(), L"Заблокировать" });
 
-    // Recovery
-    g_homeButtons.push_back({ RectF(), L"Восстановление системы" });
+    // Консоли
+    g_homeButtons.push_back({ RectF(), L"CMD" });
+    g_homeButtons.push_back({ RectF(), L"PowerShell" });
+    g_homeButtons.push_back({ RectF(), L"Терминал" });
 
-    // Command Lines
-    g_homeButtons.push_back({ RectF(), L"CMD (Админ)" });
-    g_homeButtons.push_back({ RectF(), L"PowerShell (Админ)" });
-    g_homeButtons.push_back({ RectF(), L"Выполнить" });
-
-    // Settings
-    g_homeButtons.push_back({ RectF(), L"Параметры Windows" });
-    g_homeButtons.push_back({ RectF(), L"Панель управления" });
-    g_homeButtons.push_back({ RectF(), L"Система" });
+    // Оснастки
     g_homeButtons.push_back({ RectF(), L"Диспетчер задач" });
     g_homeButtons.push_back({ RectF(), L"Редактор реестра" });
-    g_homeButtons.push_back({ RectF(), L"Проводник" });
+    g_homeButtons.push_back({ RectF(), L"Службы" });
+    g_homeButtons.push_back({ RectF(), L"Управление дисками" });
+    g_homeButtons.push_back({ RectF(), L"Просмотр событий" });
+    g_homeButtons.push_back({ RectF(), L"Планировщик" });
+    g_homeButtons.push_back({ RectF(), L"Монитор ресурсов" });
+    g_homeButtons.push_back({ RectF(), L"Диспетчер устройств" });
 
-    // Misc
+    // Восстановление
+    g_homeButtons.push_back({ RectF(), L"Восстановление" });
+    g_homeButtons.push_back({ RectF(), L"Разблокировка" });
+    g_homeButtons.push_back({ RectF(), L"msconfig" });
+
+    // Настройки
+    g_homeButtons.push_back({ RectF(), L"Параметры" });
+    g_homeButtons.push_back({ RectF(), L"Панель управления" });
+    g_homeButtons.push_back({ RectF(), L"Свойства системы" });
+    g_homeButtons.push_back({ RectF(), L"Настройки программы" });
+
+    // Утилиты
+    g_homeButtons.push_back({ RectF(), L"Проводник" });
     g_homeButtons.push_back({ RectF(), L"Блокнот" });
     g_homeButtons.push_back({ RectF(), L"Калькулятор" });
-    g_homeButtons.push_back({ RectF(), L"Настройки программы" });
-    g_homeButtons.push_back({ RectF(), L"Разблокировка" });
+    g_homeButtons.push_back({ RectF(), L"Отключить сеть" });
     g_homeButtons.push_back({ RectF(), L"Справка" });
 }
 
-// === Main page rendering ===
+// === Отрисовка ===
 void DrawHomeContent(Graphics& g, const RectF& contentArea, Font& contentFont) {
-    if (g_homeButtons.empty()) {
-        InitHomeButtons();
-    }
+    (void)contentFont;
 
-    const float btnWidth = 160.0f;
-    const float btnHeight = 48.0f;
-    const float gap = 12.0f;
-    const float topMargin = 20.0f;
-    const float leftMargin = 15.0f;
+    if (g_homeButtons.empty()) InitHomeButtons();
 
-    int cols = 1;
-    float availableWidth = contentArea.Width - 2.0f * leftMargin + gap;
-    if (availableWidth > 0.0f) {
-        cols = (int)(availableWidth / (btnWidth + gap));
-    }
-    if (cols < 1) cols = 1;
-    if (cols > 5) cols = 5;
+    const float btnW = 160.0f;
+    const float btnH = 34.0f;
+    const float gap = 6.0f;
+    const float leftMargin = 10.0f;
+    const float topMargin = 8.0f;
+    const float bottomMargin = 8.0f;
+    const float runBarH = 30.0f;
+    const float runGap = 8.0f;
 
-    int rows = (int)std::ceil(static_cast<float>(g_homeButtons.size()) / static_cast<float>(cols));
-    if (rows < 1) rows = 1;
+    FontFamily ff(g_fontFamilyName.c_str());
+    Font runFont(&ff, 11.5f, FontStyleRegular, UnitPixel);
+    Font buttonFont(&ff, 11.0f, FontStyleRegular, UnitPixel);
 
-    float totalH = rows * btnHeight + (rows - 1) * gap + 2.0f * topMargin;
-    g_maxScroll[0] = (totalH > contentArea.Height) ? (int)(totalH - contentArea.Height) : 0;
-
-    if (g_scrollOffset[0] < 0) g_scrollOffset[0] = 0;
-    if (g_scrollOffset[0] > g_maxScroll[0]) g_scrollOffset[0] = g_maxScroll[0];
-
-    int offsetY = g_scrollOffset[0];
-    float xStart = contentArea.X + leftMargin;
-    float yStart = contentArea.Y + topMargin - offsetY;
-
-    FontFamily fontFamily(g_fontFamilyName.c_str());
-    Font buttonFont(&fontFamily, 12.0f, FontStyleRegular, UnitPixel);
     SolidBrush textBrush(COLOR_TEXT);
+    SolidBrush mutedBrush(COLOR_TEXT_MUTED);
     SolidBrush buttonBg(COLOR_BUTTON_BG);
     Pen borderPen(COLOR_BORDER, 1.0f);
 
-    int index = 0;
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            if (index >= (int)g_homeButtons.size()) break;
+    // ===== Область для кнопок (сверху) =====
+    float listTop = contentArea.Y + topMargin;
+    float listBottom = contentArea.Y + contentArea.Height - bottomMargin - runBarH - runGap;
+    float listH = listBottom - listTop;
 
-            float xPos = xStart + col * (btnWidth + gap);
-            float yPos = yStart + row * (btnHeight + gap);
-            RectF rect(xPos, yPos, btnWidth, btnHeight);
+    int cols = 1;
+    float availW = contentArea.Width - 2.0f * leftMargin + gap;
+    if (availW > 0) cols = (int)(availW / (btnW + gap));
+    if (cols < 1) cols = 1;
+    if (cols > 8) cols = 8;
 
-            g_homeButtons[index].rect = rect;
+    int n = (int)g_homeButtons.size();
+    int rows = (n + cols - 1) / cols;
+    float totalH = rows * btnH + (rows - 1) * gap;
+    g_maxScroll[0] = (totalH > listH) ? (int)(totalH - listH) : 0;
+    if (g_scrollOffset[0] < 0) g_scrollOffset[0] = 0;
+    if (g_scrollOffset[0] > g_maxScroll[0]) g_scrollOffset[0] = g_maxScroll[0];
 
-            g.FillRectangle(&buttonBg, rect);
-            g.DrawRectangle(&borderPen, rect);
+    float gridY = listTop - g_scrollOffset[0];
 
-            StringFormat format;
-            format.SetAlignment(StringAlignmentCenter);
-            format.SetLineAlignment(StringAlignmentCenter);
-            format.SetTrimming(StringTrimmingEllipsisCharacter);
+    StringFormat bf;
+    bf.SetAlignment(StringAlignmentCenter);
+    bf.SetLineAlignment(StringAlignmentCenter);
+    bf.SetTrimming(StringTrimmingEllipsisCharacter);
 
-            g.DrawString(g_homeButtons[index].text.c_str(), -1, &buttonFont, rect, &format, &textBrush);
+    for (int i = 0; i < n; ++i) {
+        int r = i / cols;
+        int c = i % cols;
+        float bx = contentArea.X + leftMargin + c * (btnW + gap);
+        float by = gridY + r * (btnH + gap);
 
-            ++index;
+        g_homeButtons[i].rect = RectF(bx, by, btnW, btnH);
+
+        if (by + btnH < listTop || by > listBottom) continue;
+
+        g.FillRectangle(&buttonBg, g_homeButtons[i].rect);
+        g.DrawRectangle(&borderPen, g_homeButtons[i].rect);
+        g.DrawString(g_homeButtons[i].text.c_str(), -1, &buttonFont,
+            g_homeButtons[i].rect, &bf, &textBrush);
+    }
+
+    // ===== Run-строка (снизу) =====
+    float runY = contentArea.Y + contentArea.Height - bottomMargin - runBarH;
+
+    float maxRunW = contentArea.Width - 2.0f * leftMargin - 84.0f - 84.0f - 8.0f; // под кнопки
+    float runW = (std::min)(maxRunW, 500.0f);
+    if (runW < 200.0f) runW = (std::max)(200.0f, maxRunW);
+
+    float runX = contentArea.X + leftMargin;
+
+    g_runRect = RectF(runX, runY, runW, runBarH);
+    g_runButtonRect = RectF(g_runRect.X + g_runRect.Width + 6.0f, runY, 80.0f, runBarH);
+    g_runBrowseRect = RectF(g_runButtonRect.X + g_runButtonRect.Width + 4.0f, runY, 80.0f, runBarH);
+
+    SolidBrush runBg(g_runActive ? Color(255, 45, 45, 55) : COLOR_TAB_BG);
+    g.FillRectangle(&runBg, g_runRect);
+    Pen runBorder(g_runActive ? COLOR_TAB_ACTIVE : COLOR_BORDER, g_runActive ? 1.5f : 1.0f);
+    g.DrawRectangle(&runBorder, g_runRect);
+
+    StringFormat rf;
+    rf.SetAlignment(StringAlignmentNear);
+    rf.SetLineAlignment(StringAlignmentCenter);
+    rf.SetTrimming(StringTrimmingEllipsisCharacter);
+
+    RectF runTextRect(g_runRect.X + 8.0f, g_runRect.Y, g_runRect.Width - 16.0f, g_runRect.Height);
+    const wchar_t* placeholder = L"Команда, путь, URL...";
+    if (g_runActive && !g_runText.empty()) {
+        g.DrawString(g_runText.c_str(), -1, &runFont, runTextRect, &rf, &textBrush);
+        if (g_runCaretPos >= 0 && g_runCaretPos <= (int)g_runText.size()) {
+            RectF bb;
+            std::wstring prefix = g_runText.substr(0, g_runCaretPos);
+            PointF origin(runTextRect.X, runTextRect.Y);
+            g.MeasureString(prefix.c_str(), -1, &runFont, origin, &bb);
+            Pen caretPen(COLOR_TEXT, 1.0f);
+            g.DrawLine(&caretPen,
+                runTextRect.X + bb.Width, runTextRect.Y + 5.0f,
+                runTextRect.X + bb.Width, runTextRect.Y + runTextRect.Height - 5.0f);
         }
+    }
+    else {
+        g.DrawString(placeholder, -1, &runFont, runTextRect, &rf, &mutedBrush);
+        if (g_runActive) {
+            Pen caretPen(COLOR_TEXT, 1.0f);
+            g.DrawLine(&caretPen,
+                runTextRect.X, runTextRect.Y + 5.0f,
+                runTextRect.X, runTextRect.Y + runTextRect.Height - 5.0f);
+        }
+    }
+
+    {
+        SolidBrush bg(COLOR_TAB_ACTIVE);
+        g.FillRectangle(&bg, g_runButtonRect);
+        g.DrawString(L"Выполнить", -1, &buttonFont, g_runButtonRect, &bf, &textBrush);
+    }
+    {
+        g.FillRectangle(&buttonBg, g_runBrowseRect);
+        g.DrawRectangle(&borderPen, g_runBrowseRect);
+        g.DrawString(L"Обзор...", -1, &buttonFont, g_runBrowseRect, &bf, &textBrush);
     }
 }
 
-// === Main page clicks ===
+// === Клики ===
 bool OnHomeClick(int x, int y, const RectF& contentArea) {
-    if (g_homeButtons.empty()) {
-        InitHomeButtons();
+    (void)contentArea;
+    if (g_homeButtons.empty()) InitHomeButtons();
+
+    float fx = (float)x, fy = (float)y;
+
+    // Run-строка
+    if (HomeHitRect(g_runRect, fx, fy)) {
+        g_runActive = true;
+        g_runCaretPos = (int)g_runText.size();
+        HomeRedraw();
+        return true;
+    }
+    if (HomeHitRect(g_runButtonRect, fx, fy)) {
+        FinishRunEdit(true);
+        HomeRedraw();
+        return true;
+    }
+    if (HomeHitRect(g_runBrowseRect, fx, fy)) {
+        wchar_t file[MAX_PATH] = {};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = App::Instance()->GetHWND();
+        ofn.lpstrFilter = L"Все файлы (*.*)\0*.*\0Программы (*.exe)\0*.exe\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (GetOpenFileNameW(&ofn)) {
+            g_runText = file;
+            g_runActive = true;
+            g_runCaretPos = (int)g_runText.size();
+            HomeRedraw();
+        }
+        return true;
     }
 
-    float fx = static_cast<float>(x);
-    float fy = static_cast<float>(y);
+    // Клик вне run-строки деактивирует
+    if (g_runActive) {
+        g_runActive = false;
+        HomeRedraw();
+    }
 
+    // Кнопки
     for (size_t i = 0; i < g_homeButtons.size(); ++i) {
-        if (!HomeHitRect(g_homeButtons[i].rect, fx, fy)) {
-            continue;
+        if (!HomeHitRect(g_homeButtons[i].rect, fx, fy)) continue;
+        const std::wstring& t = g_homeButtons[i].text;
+
+        if (t == L"Перезагрузка") { HomeRebootComputer(); return true; }
+        if (t == L"Выключить") { HomeShutdownComputer(); return true; }
+        if (t == L"Спящий режим") { HomeSleepComputer(); return true; }
+        if (t == L"Выйти") { HomeLogOff(); return true; }
+        if (t == L"Заблокировать") { LockWorkStation(); return true; }
+
+        if (t == L"CMD") { Launch(L"C:\\Windows\\System32\\cmd.exe", true); return true; }
+        if (t == L"PowerShell") { Launch(L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", true); return true; }
+        if (t == L"Терминал") { Launch(L"C:\\Windows\\System32\\cmd.exe", false); return true; }
+
+        if (t == L"Диспетчер задач") { Launch(L"C:\\Windows\\System32\\taskmgr.exe", false); return true; }
+        if (t == L"Редактор реестра") { Launch(L"C:\\Windows\\regedit.exe", true); return true; }
+        if (t == L"Службы") { Launch(L"C:\\Windows\\System32\\services.msc", false); return true; }
+        if (t == L"Управление дисками") { Launch(L"C:\\Windows\\System32\\diskmgmt.msc", true); return true; }
+        if (t == L"Просмотр событий") { Launch(L"C:\\Windows\\System32\\eventvwr.msc", false); return true; }
+        if (t == L"Планировщик") { Launch(L"C:\\Windows\\System32\\taskschd.msc", false); return true; }
+        if (t == L"Монитор ресурсов") { Launch(L"C:\\Windows\\System32\\resmon.exe", false); return true; }
+        if (t == L"Диспетчер устройств") { Launch(L"C:\\Windows\\System32\\devmgmt.msc", true); return true; }
+
+        if (t == L"Восстановление") { Launch(L"C:\\Windows\\System32\\rstrui.exe", true); return true; }
+        if (t == L"Разблокировка") { HomeOpenUnlock(); return true; }
+        if (t == L"msconfig") { Launch(L"C:\\Windows\\System32\\msconfig.exe", true); return true; }
+
+        if (t == L"Параметры") { Launch(L"ms-settings:", false); return true; }
+        if (t == L"Панель управления") { Launch(L"C:\\Windows\\System32\\control.exe", false); return true; }
+        if (t == L"Свойства системы") { Launch(L"C:\\Windows\\System32\\sysdm.cpl", false); return true; }
+        if (t == L"Настройки программы") { HomeOpenProgramSettings(); return true; }
+
+        if (t == L"Проводник") { Launch(L"C:\\Windows\\explorer.exe", false); return true; }
+        if (t == L"Блокнот") { Launch(L"C:\\Windows\\notepad.exe", false); return true; }
+        if (t == L"Калькулятор") { Launch(L"C:\\Windows\\System32\\calc.exe", false); return true; }
+        if (t == L"Отключить сеть") {
+            if (MessageBoxW(App::Instance()->GetHWND(), L"Открыть управление сетевыми подключениями?",
+                L"Сеть", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                Launch(L"C:\\Windows\\System32\\ncpa.cpl", false);
+            return true;
         }
-
-        const std::wstring& text = g_homeButtons[i].text;
-
-        // Power
-        if (text == L"Перезагрузка") { HomeRebootComputer(); return true; }
-        if (text == L"Выключить") { HomeShutdownComputer(); return true; }
-        if (text == L"Спящий режим") { HomeSleepComputer(); return true; }
-        if (text == L"Выйти из системы") { HomeLogOff(); return true; }
-        if (text == L"Отключить сеть") { HomeDisableNetwork(); return true; }
-
-        // Recovery
-        if (text == L"Восстановление системы") { HomeOpenRecovery(); return true; }
-
-        // Command Lines
-        if (text == L"CMD (Админ)") { Launch(L"C:\\Windows\\System32\\cmd.exe", true); return true; }
-        if (text == L"PowerShell (Админ)") { Launch(L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", true); return true; }
-        if (text == L"Выполнить") { Launch(L"C:\\Windows\\explorer.exe", false); return true; }
-
-        // Settings
-        if (text == L"Параметры Windows") { Launch(L"C:\\Windows\\explorer.exe", false); return true; }
-        if (text == L"Панель управления") { Launch(L"C:\\Windows\\System32\\control.exe", false); return true; }
-        if (text == L"Система") { Launch(L"C:\\Windows\\System32\\sysdm.cpl", false); return true; }
-        if (text == L"Диспетчер задач") { Launch(L"C:\\Windows\\System32\\taskmgr.exe", false); return true; }
-        if (text == L"Редактор реестра") { Launch(L"C:\\Windows\\regedit.exe", true); return true; }
-        if (text == L"Проводник") { Launch(L"C:\\Windows\\explorer.exe", false); return true; }
-
-        // Misc
-        if (text == L"Блокнот") { Launch(L"C:\\Windows\\notepad.exe", false); return true; }
-        if (text == L"Калькулятор") { Launch(L"C:\\Windows\\System32\\calc.exe", false); return true; }
-
-        // Internal functions
-        if (text == L"Настройки программы") { HomeOpenProgramSettings(); return true; }
-        if (text == L"Разблокировка") { HomeOpenUnlock(); return true; }
-        if (text == L"Справка") { HomeShowHelp(); return true; }
+        if (t == L"Справка") { HomeShowHelp(); return true; }
 
         return true;
     }

@@ -11,6 +11,13 @@ namespace FileExplorer {
         bool isDirectory = false;
         unsigned long long size = 0;
         FILETIME modificationTime{};
+
+        // Sig проверка подписи
+        bool sigChecked = false;
+        bool sigValid = false;
+        bool sigInvalid = false;
+        bool sigMicrosoft = false;
+        std::wstring signer;
     };
     
     std::vector<FileItem> GetDirectoryContents(const std::wstring& path);

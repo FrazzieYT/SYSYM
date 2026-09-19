@@ -26,7 +26,7 @@ bool App::Init(HINSTANCE hInstance) {
     }
 
     // === Init ===
-    // resources
+    // Ресурсы
     std::wstring fontPath = L"assets\\embedded_font.ttf";
     PrivateFontCollection pfc;
     if (pfc.AddFontFile(fontPath.c_str()) == Ok) {
@@ -41,10 +41,10 @@ bool App::Init(HINSTANCE hInstance) {
         }
     }
 
-    // window class
+    // Окно
     WNDCLASSEXW wcex = {};
     wcex.cbSize = sizeof(WNDCLASSEXW);
-    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wcex.style = CS_DBLCLKS;
     wcex.lpfnWndProc = MainWndProc;
     wcex.hInstance = m_hInst;
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -79,8 +79,42 @@ int App::Run(int nCmdShow) {
     return (int)msg.wParam;
 }
 
+// === Back buffer ===
+void App::EnsureBackBuffer(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (m_memBitmap && m_memWidth == width && m_memHeight == height) return;
+
+    ReleaseBackBuffer();
+
+    HDC hdcScreen = GetDC(nullptr);
+    m_memDC = CreateCompatibleDC(hdcScreen);
+    m_memBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
+    if (m_memDC && m_memBitmap) {
+        m_oldBitmap = (HBITMAP)SelectObject(m_memDC, m_memBitmap);
+    }
+    ReleaseDC(nullptr, hdcScreen);
+
+    m_memWidth = width;
+    m_memHeight = height;
+}
+
+void App::ReleaseBackBuffer() {
+    if (m_memDC) {
+        if (m_oldBitmap) SelectObject(m_memDC, m_oldBitmap);
+        DeleteDC(m_memDC);
+        m_memDC = nullptr;
+        m_oldBitmap = nullptr;
+    }
+    if (m_memBitmap) {
+        DeleteObject(m_memBitmap);
+        m_memBitmap = nullptr;
+    }
+    m_memWidth = 0;
+    m_memHeight = 0;
+}
+
 // === Shell ===
-// tray management
+// Управление треем
 void App::MinimizeToTray() {
     if (!m_trayAdded) {
         NOTIFYICONDATAW nid = {};
@@ -122,6 +156,7 @@ void App::Quit() {
         Shell_NotifyIconW(NIM_DELETE, &nid);
         m_trayAdded = false;
     }
+    ReleaseBackBuffer();
     if (m_hWnd) {
         DestroyWindow(m_hWnd);
     }
